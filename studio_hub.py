@@ -1,47 +1,283 @@
 #!/usr/bin/env python3
-"""AI Studio Hub — super page linking Image, Video, Music studios + ComfyUI."""
+"""BoxDash — one page for every service on this box + a quiet watchdog.
+
+A single watchdog thread is the source of truth: it polls each service on an
+interval, applies a fail-grace so brief blips don't flap, auto-restarts a downed
+service with backoff (then gives up quietly), and records every *state change* to
+an events log. HTTP requests just serve the cached state, so the page is instant
+and every viewer sees the same status.
+"""
 
 import json
-import mimetypes
+import os
+import shutil
+import socket
+import ssl
+import subprocess
 import threading
+import time
 import urllib.request
+import mimetypes
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-HOST_IP = "192.168.2.69"
 PORT = 8189
-
-COMFY_DIR = Path.home() / "AI/ComfyUI"
+COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path(__file__).resolve().parent))
 OUTPUT_DIR = COMFY_DIR / "output"
 MUSIC_OUTPUT = Path.home() / "AI/MusicStudio/output"
+DATA_DIR = COMFY_DIR / "data"
+STATE_FILE = DATA_DIR / "boxdash-state.json"
+EVENTS_FILE = DATA_DIR / "boxdash-events.jsonl"
+RUN_SH = COMFY_DIR / "run.sh"
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
 
-STUDIOS = [
-    {"id": "images", "name": "Image Studio", "icon": "⬡", "color": "#7c6ff7",
-     "desc": "Flux Dev / Schnell / Qwen — text to image",
-     "url": f"http://{HOST_IP}:8190", "check": f"http://{HOST_IP}:8190/api/server_status"},
-    {"id": "video", "name": "Video Studio", "icon": "▶", "color": "#f76f8e",
-     "desc": "Wan 2.2 — text to video, image to video",
-     "url": f"http://{HOST_IP}:8192", "check": f"http://{HOST_IP}:8192/api/server_status"},
-    {"id": "music", "name": "Music Studio", "icon": "♫", "color": "#34d399",
-     "desc": "Stems, generation, voice, mastering",
-     "url": f"http://{HOST_IP}:8191", "check": f"http://{HOST_IP}:8191/"},
-    {"id": "comfy", "name": "ComfyUI Raw", "icon": "⚙", "color": "#fbbf24",
-     "desc": "Node graph — full control backend",
-     "url": f"http://{HOST_IP}:8188", "check": f"http://{HOST_IP}:8188/system_stats"},
+# Watchdog tuning — quiet by design.
+POLL_INTERVAL = 30          # seconds between rounds
+FAIL_THRESHOLD = 3          # consecutive fails before a service is declared down
+RESTART_MAX = 3             # restart attempts before giving up (quietly)
+RESTART_BACKOFF = 20        # base seconds; grows per attempt
+
+# Auto-restart was requested; flip to 0 for alert/log-only.
+AUTO_RESTART = os.environ.get("BOXDASH_AUTORESTART", "1") == "1"
+
+
+def _box_ip():
+    """Best-effort primary LAN IP (SABnzbd binds this, not localhost)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+BOX_IP = _box_ip()
+
+# Each service: how to check it (server-side, always via an IP that works from the
+# box), how to link it (client builds the URL from its own hostname + port), and how
+# to restart it. `restart` is an argv list or None. run.sh is idempotent: it only
+# (re)starts whatever ComfyUI service is missing, so every comfy service shares it.
+RUN_COMFY = ["/bin/bash", str(RUN_SH)]
+
+SERVICES = [
+    {"id": "plex", "name": "Plex", "cat": "Media", "icon": "▶", "color": "#e5a00d",
+     "port": 32400, "path": "/web", "check_host": "127.0.0.1", "check_path": "/identity",
+     "restart": ["open", "-a", "Plex Media Server"], "desc": "Media server"},
+    {"id": "radarr", "name": "Radarr", "cat": "Media", "icon": "🎬", "color": "#ffc230",
+     "port": 7878, "path": "/", "check_host": "127.0.0.1", "check_path": "/ping",
+     "restart": ["open", "-a", "Radarr"], "desc": "Movie manager"},
+    {"id": "sabnzbd", "name": "SABnzbd", "cat": "Downloads", "icon": "⬇", "color": "#fac026",
+     "port": 8080, "path": "/", "check_host": BOX_IP, "check_path": "/",
+     "restart": ["open", "-a", "SABnzbd"], "desc": "Usenet downloader"},
+    {"id": "ollama", "name": "Ollama", "cat": "AI", "icon": "🦙", "color": "#7c6ff7",
+     "port": 11434, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/version",
+     "restart": ["brew", "services", "restart", "ollama"], "desc": "Local LLM runtime"},
+    {"id": "comfyui", "name": "ComfyUI", "cat": "AI", "icon": "⚙", "color": "#fbbf24",
+     "port": 8188, "path": "/", "check_host": "127.0.0.1", "check_path": "/system_stats",
+     "restart": RUN_COMFY, "desc": "Diffusion backend"},
+    {"id": "images", "name": "Image Studio", "cat": "Studios", "icon": "⬡", "color": "#7c6ff7",
+     "port": 8190, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/server_status",
+     "restart": RUN_COMFY, "desc": "Text to image"},
+    {"id": "video", "name": "Video Studio", "cat": "Studios", "icon": "🎞", "color": "#f76f8e",
+     "port": 8192, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/server_status",
+     "restart": RUN_COMFY, "desc": "Text / image to video"},
+    {"id": "music", "name": "Music Studio", "cat": "Studios", "icon": "♫", "color": "#34d399",
+     "port": 8191, "path": "/", "check_host": "127.0.0.1", "check_path": "/",
+     "restart": RUN_COMFY, "desc": "Stems, generation, mastering"},
+    {"id": "hub", "name": "BoxDash", "cat": "Studios", "icon": "◧", "color": "#60a5fa",
+     "port": PORT, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/ping",
+     "restart": None, "desc": "This dashboard (self)"},
+    {"id": "magic", "name": "Magic", "cat": "Apps", "icon": "✦", "color": "#c084fc",
+     "port": 8443, "path": "/", "scheme": "https", "check_host": "127.0.0.1",
+     "check_path": "/", "restart": None, "desc": "Magic app (https)"},
 ]
 
+SERVICE_BY_ID = {s["id"]: s for s in SERVICES}
 
-def check_url(url):
+# Live watchdog state, keyed by service id.
+state_lock = threading.Lock()
+STATE = {
+    s["id"]: {"status": "unknown", "fails": 0, "latency_ms": None,
+              "since": time.time(), "restarts": 0, "last_restart": 0.0}
+    for s in SERVICES
+}
+BOX = {}
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_event(sid, kind, detail=""):
+    entry = {"ts": _now_iso(), "service": sid, "event": kind, "detail": detail}
     try:
-        with urllib.request.urlopen(url, timeout=3):
-            return True
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(EVENTS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
     except Exception:
+        pass
+
+
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode = ssl.CERT_NONE  # self-signed home-lab apps
+
+
+def check_service(svc):
+    """Return (ok, latency_ms). Any HTTP response (incl. auth pages) counts as up."""
+    scheme = svc.get("scheme", "http")
+    url = f"{scheme}://{svc['check_host']}:{svc['port']}{svc['check_path']}"
+    ctx = _TLS_CTX if scheme == "https" else None
+    start = time.time()
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=4, context=ctx):
+            pass
+        return True, int((time.time() - start) * 1000)
+    except urllib.error.HTTPError:
+        # 401/403/404 etc. still means the service answered.
+        return True, int((time.time() - start) * 1000)
+    except Exception:
+        return False, None
+
+
+def attempt_restart(svc):
+    cmd = svc.get("restart")
+    if not cmd:
+        return False
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except Exception as exc:
+        log_event(svc["id"], "restart_error", str(exc))
         return False
 
 
-def recent_media():
+def read_box_stats():
+    load1, load5, load15 = os.getloadavg()
+    du = shutil.disk_usage("/")
+    mem_total = None
+    mem_free = None
+    try:
+        mem_total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+    except Exception:
+        pass
+    try:
+        page = 4096
+        out = subprocess.check_output(["vm_stat"]).decode()
+        free = spec = inactive = 0
+        for line in out.splitlines():
+            if "page size of" in line:
+                for tok in line.split():
+                    if tok.isdigit():
+                        page = int(tok)
+            if line.startswith("Pages free:"):
+                free = int(line.split(":")[1].strip().rstrip("."))
+            elif line.startswith("Pages speculative:"):
+                spec = int(line.split(":")[1].strip().rstrip("."))
+            elif line.startswith("Pages inactive:"):
+                inactive = int(line.split(":")[1].strip().rstrip("."))
+        mem_free = (free + spec + inactive) * page
+    except Exception:
+        pass
+    uptime_s = None
+    try:
+        bt = subprocess.check_output(["sysctl", "-n", "kern.boottime"]).decode()
+        sec = int(bt.split("sec = ")[1].split(",")[0])
+        uptime_s = int(time.time() - sec)
+    except Exception:
+        pass
+    return {
+        "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
+        "cpus": os.cpu_count(),
+        "disk_total": du.total, "disk_free": du.free,
+        "mem_total": mem_total, "mem_free": mem_free,
+        "uptime_s": uptime_s,
+    }
+
+
+def watchdog_loop():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        for svc in SERVICES:
+            sid = svc["id"]
+            ok, latency = check_service(svc)
+            with state_lock:
+                st = STATE[sid]
+                prev = st["status"]
+                st["latency_ms"] = latency
+                if ok:
+                    st["fails"] = 0
+                    if prev in ("offline", "restarting", "failed", "unknown"):
+                        if prev in ("offline", "restarting", "failed"):
+                            log_event(sid, "recovered")
+                        st["status"] = "online"
+                        st["since"] = time.time()
+                        st["restarts"] = 0
+                    elif prev != "online":
+                        st["status"] = "online"
+                        st["since"] = time.time()
+                else:
+                    st["fails"] += 1
+                    if prev in ("online", "unknown") and st["fails"] >= FAIL_THRESHOLD:
+                        st["status"] = "offline"
+                        st["since"] = time.time()
+                        log_event(sid, "down", f"{st['fails']} consecutive failures")
+                    # Restart logic runs while offline/restarting and under the cap.
+                    if (AUTO_RESTART and st["status"] in ("offline", "restarting")
+                            and svc.get("restart") and st["restarts"] < RESTART_MAX):
+                        backoff = RESTART_BACKOFF * (st["restarts"] + 1)
+                        if time.time() - st["last_restart"] >= backoff:
+                            st["restarts"] += 1
+                            st["last_restart"] = time.time()
+                            st["status"] = "restarting"
+                            log_event(sid, "restart",
+                                      f"attempt {st['restarts']}/{RESTART_MAX}")
+                            attempt_restart(svc)
+                    elif (st["status"] in ("offline", "restarting")
+                          and st["restarts"] >= RESTART_MAX):
+                        if prev != "failed":
+                            log_event(sid, "gave_up",
+                                      f"still down after {RESTART_MAX} restarts")
+                        st["status"] = "failed"
+        with state_lock:
+            BOX.clear()
+            BOX.update(read_box_stats())
+            snapshot = {"ts": _now_iso(),
+                        "services": {sid: dict(v) for sid, v in STATE.items()},
+                        "box": dict(BOX)}
+        try:
+            STATE_FILE.write_text(json.dumps(snapshot, indent=2))
+        except Exception:
+            pass
+        time.sleep(POLL_INTERVAL)
+
+
+def recent_events(limit=25):
+    if not EVENTS_FILE.exists():
+        return []
+    try:
+        lines = EVENTS_FILE.read_text().splitlines()
+    except Exception:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return list(reversed(out))
+
+
+def recent_media(limit=18):
     items = []
     if OUTPUT_DIR.exists():
         for f in OUTPUT_DIR.rglob("*.png"):
@@ -60,7 +296,24 @@ def recent_media():
                               "path": str(f.relative_to(MUSIC_OUTPUT)),
                               "mtime": f.stat().st_mtime})
     items.sort(key=lambda x: x["mtime"], reverse=True)
-    return items[:24]
+    return items[:limit]
+
+
+def services_payload():
+    with state_lock:
+        svcs = []
+        for s in SERVICES:
+            st = STATE[s["id"]]
+            svcs.append({
+                "id": s["id"], "name": s["name"], "cat": s["cat"],
+                "icon": s["icon"], "color": s["color"], "desc": s["desc"],
+                "port": s["port"], "path": s["path"], "scheme": s.get("scheme", "http"),
+                "restartable": bool(s.get("restart")),
+                "status": st["status"], "latency_ms": st["latency_ms"],
+                "since": st["since"], "restarts": st["restarts"],
+            })
+        box = dict(BOX)
+    return {"services": svcs, "box": box, "events": recent_events()}
 
 
 HTML = r"""<!DOCTYPE html>
@@ -68,117 +321,292 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Studio Hub</title>
+<title>BoxDash</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2306080c'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%2337e6d4'/%3E%3Ccircle cx='32' cy='32' r='14' fill='none' stroke='%2337e6d4' stroke-width='2.5' opacity='0.6'/%3E%3Ccircle cx='32' cy='32' r='22' fill='none' stroke='%2337e6d4' stroke-width='2' opacity='0.28'/%3E%3C/svg%3E">
 <style>
-*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-:root {
-  --bg:#080808; --surface:#111; --surface2:#181818; --border:#252525; --border2:#333;
-  --text:#f0f0f0; --text2:#999; --text3:#555;
-  --success:#34d399; --error:#f87171; --radius:12px; --radius-sm:6px;
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#06080c; --panel:#0d1119; --panel2:#11161f; --line:#1b2430; --line2:#26323f;
+  --ink:#e8eef5; --ink2:#8a97a6; --ink3:#4a5563;
+  --accent:#37e6d4; --accent-dim:#1e8a80;
+  --ok:#3ad07f; --warn:#f4b740; --crit:#f2604f;
+  --mono:ui-monospace,"SF Mono",Menlo,"Cascadia Code",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
 }
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.5;min-height:100vh}
-.wrap{max-width:1100px;margin:0 auto;padding:40px 24px}
-h1{font-size:26px;font-weight:800;letter-spacing:-.03em;margin-bottom:4px}
-.sub{color:var(--text2);font-size:14px;margin-bottom:32px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px;margin-bottom:44px}
-.card{display:block;text-decoration:none;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:all .18s;position:relative}
-.card:hover{transform:translateY(-3px);border-color:var(--border2);box-shadow:0 10px 30px rgba(0,0,0,.45)}
-.card-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:12px;color:#fff}
-.card-name{font-size:16px;font-weight:700;margin-bottom:2px}
-.card-desc{font-size:12px;color:var(--text2)}
-.card-status{position:absolute;top:16px;right:16px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text3)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--text3)}
-.dot.online{background:var(--success);box-shadow:0 0 6px var(--success)}
-.dot.offline{background:var(--error)}
-.section-h{display:flex;align-items:center;gap:10px;margin-bottom:16px}
-.section-h h2{font-size:14px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.1em}
-.count{font-size:12px;color:var(--text3)}
-.media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
-.media-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;transition:all .15s}
-.media-card:hover{border-color:var(--border2);transform:translateY(-2px)}
-.media-card img,.media-card video{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:#000}
-.media-card .audio-tile{width:100%;aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(135deg,#0d2b21,#0a1a14);font-size:30px}
-.media-card audio{width:100%;height:30px}
-.media-label{padding:6px 8px;font-size:10px;color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kind-badge{position:absolute;top:6px;left:6px;font-size:9px;font-weight:700;padding:2px 6px;border-radius:8px;text-transform:uppercase;letter-spacing:.05em}
-.media-card{position:relative}
-.kind-badge.image{background:rgba(124,111,247,.85);color:#fff}
-.kind-badge.video{background:rgba(247,111,142,.85);color:#fff}
-.kind-badge.audio{background:rgba(52,211,153,.85);color:#04150e}
-.empty{color:var(--text3);font-size:13px;padding:30px 0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;overflow-x:hidden}
+#wave{position:fixed;inset:0;z-index:0;display:block}
+.wrap{position:relative;z-index:1;max-width:1240px;margin:0 auto;padding:28px 22px 64px}
+
+/* header */
+.head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:11px}
+.brand .glyph{width:34px;height:34px;border-radius:9px;background:radial-gradient(circle at 40% 35%,var(--accent),var(--accent-dim));display:flex;align-items:center;justify-content:center;color:#04110f;font-weight:800;box-shadow:0 0 22px rgba(55,230,212,.35)}
+.brand h1{font-size:20px;font-weight:800;letter-spacing:-.02em}
+.brand h1 span{color:var(--accent)}
+.pill{font-family:var(--mono);font-size:12px;color:var(--ink2);background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:4px 12px}
+.pill b{color:var(--ok)}
+.head .sp{flex:1}
+.tick{font-family:var(--mono);font-size:11px;color:var(--ink3);display:flex;align-items:center;gap:6px}
+.tick i{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:beat 2s infinite}
+@keyframes beat{50%{opacity:.3}}
+
+/* vitals */
+.vitals{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:11px;margin-bottom:6px}
+.vital{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:13px;padding:13px 15px}
+.vital .k{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin-bottom:5px}
+.vital .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+.vital .v small{font-size:12px;color:var(--ink2);font-weight:400}
+.meter{height:4px;border-radius:3px;background:#0a0e14;margin-top:9px;overflow:hidden}
+.meter>span{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent-dim),var(--accent));transition:width .5s}
+.meter>span.hot{background:linear-gradient(90deg,#8a6a12,var(--warn))}
+.meter>span.crit{background:linear-gradient(90deg,#7a271f,var(--crit))}
+
+/* cover flow */
+.stage-wrap{margin:30px 0 8px}
+.stage-title{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.stage-title h2{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink3)}
+.stage-title .hint{font-family:var(--mono);font-size:10px;color:var(--ink3);margin-left:auto}
+.stage{position:relative;height:340px;perspective:1600px;overflow:hidden;user-select:none}
+.flow{position:absolute;inset:0;transform-style:preserve-3d}
+.cf{position:absolute;top:50%;left:50%;width:230px;height:264px;margin:-132px 0 0 -115px;
+  background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line2);
+  border-radius:18px;padding:20px;cursor:pointer;transition:transform .5s cubic-bezier(.22,1,.36,1),opacity .5s,box-shadow .3s;
+  display:flex;flex-direction:column;backface-visibility:hidden}
+.cf .cat{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3)}
+.cf .ic{width:56px;height:56px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-size:27px;margin:14px 0 12px}
+.cf .nm{font-size:19px;font-weight:800;letter-spacing:-.01em}
+.cf .ds{font-size:12px;color:var(--ink2);margin-top:3px;flex:1}
+.cf .ft{display:flex;align-items:center;justify-content:space-between;margin-top:10px;font-family:var(--mono);font-size:11px}
+.cf .stat{display:flex;align-items:center;gap:7px;font-weight:700;text-transform:capitalize}
+.cf .dot{width:9px;height:9px;border-radius:50%;background:var(--ink3);flex-shrink:0}
+.dot.online{background:var(--ok);box-shadow:0 0 9px var(--ok)}
+.dot.offline,.dot.failed{background:var(--crit);box-shadow:0 0 9px var(--crit)}
+.dot.restarting{background:var(--warn);box-shadow:0 0 9px var(--warn);animation:beat 1s infinite}
+.st-online{color:var(--ok)}.st-offline,.st-failed{color:var(--crit)}.st-restarting{color:var(--warn)}.st-unknown{color:var(--ink3)}
+.cf .port{color:var(--ink3)}
+.cf.center{box-shadow:0 30px 70px rgba(0,0,0,.6),0 0 0 1px var(--accent-dim)}
+.cf.center .nm{color:#fff}
+.cf .reflect{position:absolute;left:0;right:0;bottom:-46%;height:44%;border-radius:18px;
+  background:linear-gradient(180deg,rgba(255,255,255,.05),transparent);transform:scaleY(-1);opacity:.5;pointer-events:none}
+.flow-nav{position:absolute;top:50%;transform:translateY(-50%);z-index:5;width:42px;height:42px;border-radius:50%;
+  background:rgba(13,17,25,.8);border:1px solid var(--line2);color:var(--ink);font-size:18px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);transition:all .15s}
+.flow-nav:hover{border-color:var(--accent);color:var(--accent)}
+#fprev{left:6px}#fnext{right:6px}
+.dots{display:flex;gap:6px;justify-content:center;margin-top:14px}
+.dots i{width:6px;height:6px;border-radius:50%;background:var(--line2);cursor:pointer;transition:all .2s}
+.dots i.on{background:var(--accent);width:18px;border-radius:3px}
+
+/* lower panels */
+.cols{display:grid;grid-template-columns:1fr;gap:18px;margin-top:34px}
+@media(min-width:900px){.cols{grid-template-columns:1.25fr 1fr}}
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:15px;padding:18px}
+.panel h2{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:.14em;margin-bottom:14px}
+.ev{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line);font-size:12px}
+.ev:last-child{border-bottom:none}
+.ev .et{font-family:var(--mono);color:var(--ink3);font-size:11px;white-space:nowrap}
+.ev .es{font-weight:700;min-width:82px}
+.ev .ek{font-family:var(--mono);padding:1px 7px;border-radius:7px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.ek.down,.ek.gave_up,.ek.restart_error{background:rgba(242,96,79,.16);color:var(--crit)}
+.ek.recovered{background:rgba(58,208,127,.16);color:var(--ok)}
+.ek.restart{background:rgba(244,183,64,.16);color:var(--warn)}
+.ev .ed{color:var(--ink3)}
+.empty{color:var(--ink3);font-size:12px;padding:14px 0}
+.media{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:7px}
+.media a{display:block;border-radius:9px;overflow:hidden;border:1px solid var(--line);aspect-ratio:1;background:#000}
+.media img,.media video{width:100%;height:100%;object-fit:cover;display:block}
+.media .aud{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;background:linear-gradient(135deg,#0d2b21,#0a1a14)}
+@media(prefers-reduced-motion:reduce){.cf{transition:none}.tick i,.dot.restarting{animation:none}}
 </style>
 </head>
 <body>
+<canvas id="wave"></canvas>
 <div class="wrap">
-  <h1>AI Studio Hub</h1>
-  <div class="sub">One place for everything — pick a studio or browse recent output.</div>
+  <div class="head">
+    <div class="brand"><div class="glyph">◧</div><h1>Box<span>Dash</span></h1></div>
+    <span class="pill"><b id="pill-up">–</b> <span id="pill-tot">/ –</span> up</span>
+    <div class="sp"></div>
+    <div class="tick"><i></i><span id="tick">live · 5s</span></div>
+  </div>
 
-  <div class="grid" id="studios"></div>
+  <div class="vitals" id="vitals"></div>
 
-  <div class="section-h"><h2>Recent Output</h2><span class="count" id="media-count"></span></div>
-  <div class="media-grid" id="media"></div>
+  <div class="stage-wrap">
+    <div class="stage-title"><h2>Services</h2><span class="hint">← → scroll · click to open</span></div>
+    <div class="stage" id="stage">
+      <button class="flow-nav" id="fprev" aria-label="Previous">&#8249;</button>
+      <div class="flow" id="flow"></div>
+      <button class="flow-nav" id="fnext" aria-label="Next">&#8250;</button>
+    </div>
+    <div class="dots" id="dots"></div>
+  </div>
+
+  <div class="cols">
+    <div class="panel">
+      <h2>Watchdog Events</h2>
+      <div id="events"><div class="empty">No state changes yet — all quiet.</div></div>
+    </div>
+    <div class="panel">
+      <h2>Recent Output</h2>
+      <div class="media" id="mediaGrid"></div>
+    </div>
+  </div>
 </div>
 
 <script>
-const STUDIOS = __STUDIOS__;
+const CATS=["Media","Downloads","AI","Studios","Apps"];
+let SVCS=[],SVMAP={},center=0;
 
-function render() {
-  const g = document.getElementById('studios');
-  g.innerHTML = '';
-  STUDIOS.forEach(s => {
-    const a = document.createElement('a');
-    a.className = 'card';
-    a.href = s.url;
-    a.target = '_blank';
-    a.innerHTML = `
-      <div class="card-status"><span id="st-${s.id}-txt">…</span><div class="dot" id="st-${s.id}"></div></div>
-      <div class="card-icon" style="background:${s.color}">${s.icon}</div>
-      <div class="card-name">${s.name}</div>
-      <div class="card-desc">${s.desc}</div>`;
-    g.appendChild(a);
+function fmtBytes(b){if(b==null)return"–";const u=["B","KB","MB","GB","TB"];let i=0,n=b;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(n<10&&i>0?1:0)+u[i]}
+function fmtDur(s){if(s==null)return"–";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);if(d)return d+"d "+h+"h";if(h)return h+"h "+m+"m";return m+"m"}
+
+/* ---------- wave / particle background ---------- */
+(function(){
+  const c=document.getElementById("wave"),x=c.getContext("2d");
+  const reduce=matchMedia("(prefers-reduced-motion:reduce)").matches;
+  let w,h,parts=[];
+  function size(){w=c.width=innerWidth*devicePixelRatio;h=c.height=innerHeight*devicePixelRatio;
+    c.style.width=innerWidth+"px";c.style.height=innerHeight+"px";
+    const n=Math.min(120,Math.floor(innerWidth/14));
+    parts=[];for(let i=0;i<n;i++)parts.push({x:Math.random()*w,y:Math.random()*h,
+      sp:.15+Math.random()*.4,amp:8+Math.random()*22,ph:Math.random()*Math.PI*2,r:(0.6+Math.random()*1.6)*devicePixelRatio});
+  }
+  size();addEventListener("resize",size);
+  let t=0;
+  function frame(){
+    t+=reduce?0:0.006;
+    x.clearRect(0,0,w,h);
+    // flowing wave guide lines
+    for(let k=0;k<3;k++){
+      x.beginPath();
+      const yb=h*(0.35+k*0.2), amp=(18+k*10)*devicePixelRatio;
+      for(let px=0;px<=w;px+=14*devicePixelRatio){
+        const y=yb+Math.sin(px*0.004+t*1.4+k)*amp+Math.sin(px*0.011-t)*amp*0.4;
+        px===0?x.moveTo(px,y):x.lineTo(px,y);
+      }
+      x.strokeStyle="rgba(55,230,212,"+(0.05-k*0.012)+")";x.lineWidth=1*devicePixelRatio;x.stroke();
+    }
+    // particles riding the wave
+    for(const p of parts){
+      p.x+=p.sp*devicePixelRatio; if(p.x>w+20)p.x=-20;
+      const y=p.y+Math.sin(p.x*0.006+t*2+p.ph)*p.amp*devicePixelRatio;
+      x.beginPath();x.arc(p.x,y,p.r,0,7);
+      x.fillStyle="rgba(55,230,212,0.5)";x.fill();
+    }
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+
+/* ---------- cover flow ---------- */
+function buildFlow(){
+  const flow=document.getElementById("flow");flow.innerHTML="";
+  SVCS.forEach((s,i)=>{
+    const el=document.createElement("div");el.className="cf";el.dataset.i=i;
+    el.innerHTML=`
+      <div class="cat">${s.cat}</div>
+      <div class="ic" style="background:${s.color}1e;color:${s.color}">${s.icon}</div>
+      <div class="nm">${s.name}</div>
+      <div class="ds">${s.desc}</div>
+      <div class="ft">
+        <span class="stat st-${s.status}"><span class="dot ${s.status}"></span>${s.status}</span>
+        <span class="port">:${s.port}</span>
+      </div>
+      <div class="reflect"></div>`;
+    el.onclick=()=>{ if(i===center){openSvc(s);} else {center=i;layout();} };
+    flow.appendChild(el);
   });
+  const dots=document.getElementById("dots");dots.innerHTML="";
+  SVCS.forEach((s,i)=>{const d=document.createElement("i");if(i===center)d.className="on";d.onclick=()=>{center=i;layout();};dots.appendChild(d);});
+  layout();
 }
-
-async function checkStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    STUDIOS.forEach(s => {
-      const dot = document.getElementById('st-' + s.id);
-      const txt = document.getElementById('st-' + s.id + '-txt');
-      const on = d[s.id];
-      dot.className = 'dot ' + (on ? 'online' : 'offline');
-      txt.textContent = on ? 'online' : 'offline';
-    });
-  } catch {}
+function layout(){
+  const cards=document.querySelectorAll(".cf");
+  cards.forEach((el,i)=>{
+    const off=i-center;const a=Math.abs(off);
+    const tx=off*150 - Math.sign(off)*20*Math.min(a,1);
+    const ry=off===0?0:(off<0?38:-38);
+    const tz=off===0?60:-Math.min(a,4)*80;
+    el.style.transform=`translateX(${tx}px) translateZ(${tz}px) rotateY(${ry}deg)`;
+    el.style.opacity=a>4?0:1-a*0.12;
+    el.style.zIndex=100-a;
+    el.classList.toggle("center",off===0);
+  });
+  document.querySelectorAll(".dots i").forEach((d,i)=>d.className=i===center?"on":"");
 }
+function openSvc(s){ if(s.id==="hub")return; const url=`${s.scheme}://${location.hostname}:${s.port}${s.path}`; window.open(url,"_blank"); }
+function move(dir){ center=Math.max(0,Math.min(SVCS.length-1,center+dir)); layout(); }
+document.getElementById("fprev").onclick=()=>move(-1);
+document.getElementById("fnext").onclick=()=>move(1);
+addEventListener("keydown",e=>{if(e.key==="ArrowLeft")move(-1);if(e.key==="ArrowRight")move(1);
+  if(e.key==="Enter"&&SVCS[center])openSvc(SVCS[center]);});
+let wheelLock=0;
+document.getElementById("stage").addEventListener("wheel",e=>{e.preventDefault();
+  const now=Date.now();if(now-wheelLock<220)return;wheelLock=now;move(e.deltaY>0||e.deltaX>0?1:-1);},{passive:false});
 
-async function loadMedia() {
-  try {
-    const r = await fetch('/api/recent');
-    const items = await r.json();
-    document.getElementById('media-count').textContent = items.length ? items.length + ' items' : '';
-    const g = document.getElementById('media');
-    g.innerHTML = items.length ? '' : '<div class="empty">Nothing generated yet.</div>';
-    items.forEach(m => {
-      const card = document.createElement('div');
-      card.className = 'media-card';
-      let inner;
-      const src = '/media/' + m.kind + '/' + encodeURI(m.path);
-      if (m.kind === 'image') inner = `<img src="${src}" loading="lazy">`;
-      else if (m.kind === 'video') inner = `<video src="${src}" muted loop playsinline preload="metadata" onmouseover="this.play()" onmouseout="this.pause()"></video>`;
-      else inner = `<div class="audio-tile">♫<audio src="${src}" controls preload="none"></audio></div>`;
-      card.innerHTML = `<span class="kind-badge ${m.kind}">${m.kind}</span>${inner}<div class="media-label">${m.name}</div>`;
-      g.appendChild(card);
-    });
-  } catch {}
+/* ---------- data ---------- */
+function order(list){return [...list].sort((a,b)=>CATS.indexOf(a.cat)-CATS.indexOf(b.cat)||a.name.localeCompare(b.name));}
+function renderVitals(b,up,tot){
+  const memUsed=(b.mem_total&&b.mem_free)?b.mem_total-b.mem_free:null;
+  const memPct=memUsed?Math.round(memUsed/b.mem_total*100):0;
+  const diskUsed=(b.disk_total&&b.disk_free)?b.disk_total-b.disk_free:null;
+  const diskPct=diskUsed?Math.round(diskUsed/b.disk_total*100):0;
+  const loadPct=(b.load&&b.cpus)?Math.min(100,Math.round(b.load[0]/b.cpus*100)):0;
+  const cls=p=>p>=90?"crit":p>=70?"hot":"";
+  document.getElementById("vitals").innerHTML=`
+    <div class="vital"><div class="k">Services</div><div class="v">${up}<small> / ${tot} up</small></div><div class="meter"><span class="${up<tot?'hot':''}" style="width:${tot?up/tot*100:0}%"></span></div></div>
+    <div class="vital"><div class="k">Load 1m</div><div class="v">${b.load?b.load[0]:"–"}<small> · ${b.cpus||"?"} cpu</small></div><div class="meter"><span class="${cls(loadPct)}" style="width:${loadPct}%"></span></div></div>
+    <div class="vital"><div class="k">Memory</div><div class="v">${fmtBytes(memUsed)}<small> / ${fmtBytes(b.mem_total)}</small></div><div class="meter"><span class="${cls(memPct)}" style="width:${memPct}%"></span></div></div>
+    <div class="vital"><div class="k">Disk free</div><div class="v">${fmtBytes(b.disk_free)}<small> / ${fmtBytes(b.disk_total)}</small></div><div class="meter"><span class="${cls(diskPct)}" style="width:${diskPct}%"></span></div></div>
+    <div class="vital"><div class="k">Uptime</div><div class="v">${fmtDur(b.uptime_s)}</div></div>`;
 }
-
-render();
-checkStatus();
-loadMedia();
-setInterval(checkStatus, 10000);
-setInterval(loadMedia, 15000);
+function renderEvents(events){
+  const ev=document.getElementById("events");
+  if(!events||!events.length){ev.innerHTML='<div class="empty">No state changes yet — all quiet.</div>';return;}
+  ev.innerHTML=events.map(e=>{
+    const t=(e.ts||"").replace("T"," ").replace("Z","").slice(5,16);
+    const nm=(SVMAP[e.service]||{}).name||e.service;
+    return `<div class="ev"><span class="et">${t}</span><span class="es">${nm}</span><span class="ek ${e.event}">${e.event.replace(/_/g," ")}</span><span class="ed">${e.detail||""}</span></div>`;
+  }).join("");
+}
+async function tick(){
+  try{
+    const d=await(await fetch("/api/status")).json();
+    SVCS=order(d.services);SVMAP={};SVCS.forEach(s=>SVMAP[s.id]=s);
+    const up=SVCS.filter(s=>s.status==="online").length;
+    document.getElementById("pill-up").textContent=up;
+    document.getElementById("pill-tot").textContent="/ "+SVCS.length;
+    renderVitals(d.box||{},up,SVCS.length);
+    if(document.querySelectorAll(".cf").length!==SVCS.length){center=Math.min(center,SVCS.length-1);buildFlow();}
+    else{ // update status in place without rebuilding (keeps flow position)
+      document.querySelectorAll(".cf").forEach((el,i)=>{
+        const s=SVCS[i];if(!s)return;
+        const stat=el.querySelector(".stat");
+        stat.className="stat st-"+s.status;
+        stat.innerHTML=`<span class="dot ${s.status}"></span>${s.status}`;
+      });
+    }
+    renderEvents(d.events);
+  }catch(e){}
+}
+async function media(){
+  try{
+    const items=await(await fetch("/api/recent")).json();
+    const g=document.getElementById("mediaGrid");
+    if(!items.length){g.innerHTML='<div class="empty">Nothing generated yet.</div>';return;}
+    g.innerHTML=items.map(m=>{
+      const src="/media/"+m.kind+"/"+encodeURI(m.path);
+      let inner=m.kind==="image"?`<img src="${src}" loading="lazy">`
+        :m.kind==="video"?`<video src="${src}" muted playsinline preload="metadata"></video>`
+        :`<div class="aud">♫</div>`;
+      return `<a href="${src}" target="_blank" title="${m.name}">${inner}</a>`;
+    }).join("");
+  }catch(e){}
+}
+tick();media();
+setInterval(tick,5000);
+setInterval(media,15000);
 </script>
 </body>
 </html>
@@ -199,16 +627,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            page = HTML.replace("__STUDIOS__", json.dumps(
-                [{k: s[k] for k in ("id", "name", "icon", "color", "desc", "url")} for s in STUDIOS]))
-            data = page.encode()
+            data = HTML.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/api/ping":
+            self._json({"ok": True})
         elif self.path == "/api/status":
-            self._json({s["id"]: check_url(s["check"]) for s in STUDIOS})
+            self._json(services_payload())
         elif self.path == "/api/recent":
             self._json(recent_media())
         elif self.path.startswith("/media/"):
@@ -219,7 +647,12 @@ class Handler(BaseHTTPRequestHandler):
             kind, rel = parts[0], urllib.request.url2pathname(parts[1])
             root = MUSIC_OUTPUT if kind == "audio" else OUTPUT_DIR
             p = (root / rel).resolve()
-            if not str(p).startswith(str(root.resolve())) or not p.is_file():
+            try:
+                p.relative_to(root.resolve())
+            except ValueError:
+                self._json({"error": "forbidden"}, 403)
+                return
+            if not p.is_file():
                 self._json({"error": "not found"}, 404)
                 return
             ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
@@ -237,7 +670,8 @@ class ThreadingHTTPServer(HTTPServer):
     daemon_threads = True
 
     def process_request(self, request, client_address):
-        threading.Thread(target=self._handle, args=(request, client_address), daemon=True).start()
+        threading.Thread(target=self._handle, args=(request, client_address),
+                         daemon=True).start()
 
     def _handle(self, request, client_address):
         try:
@@ -249,6 +683,8 @@ class ThreadingHTTPServer(HTTPServer):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=watchdog_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[+] AI Studio Hub running at http://{HOST_IP}:{PORT}")
+    print(f"[+] BoxDash → http://{BOX_IP}:{PORT}  (watchdog: "
+          f"{'auto-restart' if AUTO_RESTART else 'alert-only'}, poll {POLL_INTERVAL}s)")
     server.serve_forever()

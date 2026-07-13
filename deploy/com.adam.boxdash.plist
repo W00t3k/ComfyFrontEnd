@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.adam.boxdash</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/wootock/AI/ComfyUI/venv/bin/python</string>
+      <string>/Users/wootock/AI/ComfyUI/studio_hub.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/wootock/AI/ComfyUI</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>COMFY_DIR</key>
+      <string>/Users/wootock/AI/ComfyUI</string>
+      <key>BOXDASH_AUTORESTART</key>
+      <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/wootock/AI/ComfyUI/logs/boxdash.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/wootock/AI/ComfyUI/logs/boxdash.launchd.err.log</string>
+  </dict>
+</plist>

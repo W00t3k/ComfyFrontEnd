@@ -10,9 +10,31 @@ Built and tuned for Apple Silicon (M-series, MPS).
 |--------|------|------|--------------|
 | Image  | 8190 | `webui.py`      | FLUX.2 Klein / FLUX.1 Schnell / Dev / Qwen — text-to-image, styles, enhance, gallery |
 | Video  | 8192 | `videoui.py`    | Wan 2.2 — text-to-video, image-to-video, real per-step progress |
-| Hub    | 8189 | `studio_hub.py` | Landing page linking all studios + recent-output grid |
+| BoxDash| 8189 | `studio_hub.py` | Box-wide dashboard: every service's live status + watchdog + recent output |
 
 The ComfyUI backend itself runs on port 8188.
+
+## BoxDash
+
+`studio_hub.py` is a whole-box dashboard, not just a Comfy hub. It shows every
+service on the machine (Plex, Radarr, SABnzbd, Ollama, ComfyUI + studios, and a
+`Magic` https app on 8443) as a Cover Flow carousel over a wave-particle canvas,
+plus box vitals (load / memory / disk / uptime).
+
+A single **watchdog** thread is the source of truth: it polls each service every
+30 s, waits for 3 consecutive failures before declaring one down (no flapping),
+auto-restarts it with backoff (max 3 tries, then gives up quietly), and logs every
+*state change* to `data/boxdash-events.jsonl`. HTTP requests only serve the cached
+state, so the page is instant. Alerts are dashboard + log only — nothing noisy.
+
+Run it as a launchd service (survives reboots + its own crashes via `KeepAlive`):
+
+```bash
+cp deploy/com.adam.boxdash.plist ~/Library/LaunchAgents/   # edit paths first
+launchctl load ~/Library/LaunchAgents/com.adam.boxdash.plist
+```
+
+Set `BOXDASH_AUTORESTART=0` to make the watchdog alert/log-only instead of restarting.
 
 ## Quick start
 
