@@ -371,10 +371,13 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .flow{position:absolute;inset:0;transform-style:preserve-3d}
 .cf{position:absolute;top:50%;left:50%;width:230px;height:264px;margin:-132px 0 0 -115px;
   background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line2);
-  border-radius:18px;padding:20px;cursor:pointer;transition:transform .5s cubic-bezier(.22,1,.36,1),opacity .5s,box-shadow .3s;
+  border-radius:18px;overflow:hidden;cursor:pointer;transition:transform .5s cubic-bezier(.22,1,.36,1),opacity .5s,box-shadow .3s;
   display:flex;flex-direction:column;backface-visibility:hidden}
-.cf .cat{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3)}
-.cf .ic{width:56px;height:56px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-size:27px;margin:14px 0 12px}
+.cf .cover{position:relative;height:140px;overflow:hidden;flex-shrink:0}
+.cf .cover svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.cf .cover::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 55%,var(--panel) 100%)}
+.cf .cat{position:absolute;top:11px;left:13px;z-index:2;font-family:var(--mono);font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.82);text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.cf .body{padding:0 18px 18px;display:flex;flex-direction:column;flex:1;position:relative;z-index:2;margin-top:-6px}
 .cf .nm{font-size:19px;font-weight:800;letter-spacing:-.01em}
 .cf .ds{font-size:12px;color:var(--ink2);margin-top:3px;flex:1}
 .cf .ft{display:flex;align-items:center;justify-content:space-between;margin-top:10px;font-family:var(--mono);font-size:11px}
@@ -499,21 +502,68 @@ function fmtDur(s){if(s==null)return"–";const d=Math.floor(s/86400),h=Math.flo
   frame();
 })();
 
+/* ---------- generative cover art (self-contained SVG per service) ---------- */
+function hexPts(cx,cy,r){let p=[];for(let i=0;i<6;i++){const a=Math.PI/6+i*Math.PI/3;p.push((cx+r*Math.cos(a)).toFixed(1)+","+(cy+r*Math.sin(a)).toFixed(1));}return p.join(" ");}
+function coverArt(s){
+  const c=s.color,uid="cg-"+s.id;let m="";
+  switch(s.id){
+    case "plex": case "video":
+      m=`${[...Array(6)].map((_,i)=>`<rect x="${26+i*3.2}" y="34" width="2" height="72" fill="#fff" opacity=".07"/>`).join("")}
+         <path d="M96 44 L154 72 L96 100 Z" fill="${c}" opacity=".92"/>
+         <path d="M96 44 L154 72 L96 100 Z" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="1.5"/>`;break;
+    case "radarr":
+      m=`<g transform="translate(112,70)"><circle r="47" fill="none" stroke="${c}" stroke-width="6" opacity=".85"/>
+         <circle r="11" fill="${c}"/>${[0,72,144,216,288].map(a=>{const x=30*Math.cos(a*Math.PI/180),y=30*Math.sin(a*Math.PI/180);return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="7" fill="none" stroke="${c}" stroke-width="4" opacity=".7"/>`;}).join("")}</g>`;break;
+    case "sabnzbd":
+      m=`<g stroke="${c}" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round">
+         <path d="M92 38 L116 58 L140 38" opacity=".35"/><path d="M92 57 L116 77 L140 57" opacity=".65"/><path d="M92 76 L116 96 L140 76"/></g>
+         <rect x="84" y="106" width="64" height="6" rx="3" fill="${c}" opacity=".9"/>`;break;
+    case "ollama": case "comfyui": {
+      const pts=[[52,46],[112,32],[168,58],[74,98],[150,104],[116,72]];
+      const edges=[[0,1],[1,2],[0,5],[1,5],[2,4],[3,5],[4,5],[3,0]];
+      const node=s.id==="comfyui"
+        ? p=>`<rect x="${p[0]-11}" y="${p[1]-8}" width="22" height="16" rx="4" fill="#0b0f16" stroke="${c}" stroke-width="2.5"/>`
+        : p=>`<circle cx="${p[0]}" cy="${p[1]}" r="9" fill="#0b0f16" stroke="${c}" stroke-width="2.5"/>`;
+      m=`${edges.map(([a,b])=>`<line x1="${pts[a][0]}" y1="${pts[a][1]}" x2="${pts[b][0]}" y2="${pts[b][1]}" stroke="${c}" stroke-width="1.5" opacity=".4"/>`).join("")}
+         ${pts.map(node).join("")}`;break;}
+    case "images":
+      m=`<polygon points="${hexPts(96,64,34)}" fill="none" stroke="${c}" stroke-width="3" opacity=".8"/>
+         <polygon points="${hexPts(134,82,26)}" fill="${c}" fill-opacity=".14" stroke="${c}" stroke-width="2.5" opacity=".7"/>
+         <polygon points="${hexPts(120,50,18)}" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="2"/>`;break;
+    case "music":
+      m=`${[...Array(12)].map((_,i)=>{const h=16+Math.abs(Math.sin(i*0.9+1))*74;return `<rect x="${26+i*15}" y="${(112-h).toFixed(1)}" width="8" height="${h.toFixed(1)}" rx="4" fill="${c}" opacity="${(.5+(i%3)*0.16).toFixed(2)}"/>`;}).join("")}`;break;
+    case "magic":
+      m=`<g transform="translate(112,70)"><path d="M0 -46 C6 -12 12 -6 46 0 C12 6 6 12 0 46 C-6 12 -12 6 -46 0 C-12 -6 -6 -12 0 -46 Z" fill="${c}" opacity=".9"/>
+         <circle cx="-52" cy="-30" r="4" fill="#fff" opacity=".8"/><circle cx="54" cy="20" r="5" fill="${c}"/><circle cx="30" cy="-44" r="3" fill="#fff" opacity=".7"/></g>`;break;
+    default: /* hub / radar */
+      m=`<g transform="translate(96,70)"><circle r="22" fill="none" stroke="${c}" stroke-width="2" opacity=".5"/>
+         <circle r="42" fill="none" stroke="${c}" stroke-width="2" opacity=".32"/><circle r="62" fill="none" stroke="${c}" stroke-width="2" opacity=".18"/>
+         <line x1="0" y1="0" x2="54" y2="-30" stroke="${c}" stroke-width="2.5"/><circle r="5" fill="${c}"/></g>`;
+  }
+  return `<svg viewBox="0 0 230 140" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+    <defs><radialGradient id="${uid}" cx="32%" cy="26%" r="95%">
+      <stop offset="0%" stop-color="${c}" stop-opacity=".5"/><stop offset="52%" stop-color="${c}" stop-opacity=".12"/><stop offset="100%" stop-color="${c}" stop-opacity="0"/>
+    </radialGradient></defs>
+    <rect width="230" height="140" fill="#0b0f16"/><rect width="230" height="140" fill="url(#${uid})"/>
+    ${[...Array(8)].map((_,i)=>`<line x1="0" y1="${i*20}" x2="230" y2="${i*20}" stroke="#fff" stroke-opacity=".025"/>`).join("")}
+    ${m}</svg>`;
+}
+
 /* ---------- cover flow ---------- */
 function buildFlow(){
   const flow=document.getElementById("flow");flow.innerHTML="";
   SVCS.forEach((s,i)=>{
     const el=document.createElement("div");el.className="cf";el.dataset.i=i;
     el.innerHTML=`
-      <div class="cat">${s.cat}</div>
-      <div class="ic" style="background:${s.color}1e;color:${s.color}">${s.icon}</div>
-      <div class="nm">${s.name}</div>
-      <div class="ds">${s.desc}</div>
-      <div class="ft">
-        <span class="stat st-${s.status}"><span class="dot ${s.status}"></span>${s.status}</span>
-        <span class="port">:${s.port}</span>
-      </div>
-      <div class="reflect"></div>`;
+      <div class="cover">${coverArt(s)}<span class="cat">${s.cat}</span></div>
+      <div class="body">
+        <div class="nm">${s.name}</div>
+        <div class="ds">${s.desc}</div>
+        <div class="ft">
+          <span class="stat st-${s.status}"><span class="dot ${s.status}"></span>${s.status}</span>
+          <span class="port">:${s.port}</span>
+        </div>
+      </div>`;
     el.onclick=()=>{ if(i===center){openSvc(s);} else {center=i;layout();} };
     flow.appendChild(el);
   });

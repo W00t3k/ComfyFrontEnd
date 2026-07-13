@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.adam.comfystack</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>/Users/wootock/AI/ComfyUI/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/wootock/AI/ComfyUI</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>COMFY_DIR</key>
+      <string>/Users/wootock/AI/ComfyUI</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only when run.sh dies badly (backend crash). A clean exit 0
+         means "everything already up" - do NOT restart, or launchd thrashes. -->
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>20</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/wootock/AI/ComfyUI/logs/comfystack.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/wootock/AI/ComfyUI/logs/comfystack.launchd.err.log</string>
+  </dict>
+</plist>
