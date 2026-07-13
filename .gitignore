@@ -1,0 +1,22 @@
+# Runtime / generated
+/output/
+/upscaled/
+/input/
+/logs/
+/.studio-run/
+generation_history.jsonl
+video_history.jsonl
+
+# Models (huge, download via the scripts)
+/models/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# OS / editor
+.DS_Store
+*.bak
+*.part
