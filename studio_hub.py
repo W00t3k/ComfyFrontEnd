@@ -102,7 +102,8 @@ SERVICE_BY_ID = {s["id"]: s for s in SERVICES}
 state_lock = threading.Lock()
 STATE = {
     s["id"]: {"status": "unknown", "fails": 0, "latency_ms": None,
-              "since": time.time(), "restarts": 0, "last_restart": 0.0}
+              "since": time.time(), "restarts": 0, "last_restart": 0.0,
+              "scheme": s.get("scheme", "http")}
     for s in SERVICES
 }
 BOX = {}
@@ -127,9 +128,7 @@ _TLS_CTX.check_hostname = False
 _TLS_CTX.verify_mode = ssl.CERT_NONE  # self-signed home-lab apps
 
 
-def check_service(svc):
-    """Return (ok, latency_ms). Any HTTP response (incl. auth pages) counts as up."""
-    scheme = svc.get("scheme", "http")
+def _try_scheme(scheme, svc):
     url = f"{scheme}://{svc['check_host']}:{svc['port']}{svc['check_path']}"
     ctx = _TLS_CTX if scheme == "https" else None
     start = time.time()
@@ -143,6 +142,21 @@ def check_service(svc):
         return True, int((time.time() - start) * 1000)
     except Exception:
         return False, None
+
+
+def check_service(svc):
+    """Return (ok, latency_ms, working_scheme).
+
+    Tries the configured scheme first, then the other, so a service is reported
+    correctly (and linked correctly) whether it actually speaks http or https.
+    """
+    preferred = svc.get("scheme", "http")
+    order = [preferred, "http" if preferred == "https" else "https"]
+    for scheme in order:
+        ok, latency = _try_scheme(scheme, svc)
+        if ok:
+            return True, latency, scheme
+    return False, None, preferred
 
 
 def attempt_restart(svc):
@@ -207,11 +221,13 @@ def watchdog_loop():
     while True:
         for svc in SERVICES:
             sid = svc["id"]
-            ok, latency = check_service(svc)
+            ok, latency, scheme = check_service(svc)
             with state_lock:
                 st = STATE[sid]
                 prev = st["status"]
                 st["latency_ms"] = latency
+                if ok:
+                    st["scheme"] = scheme
                 if ok:
                     st["fails"] = 0
                     if prev in ("offline", "restarting", "failed", "unknown"):
@@ -307,7 +323,8 @@ def services_payload():
             svcs.append({
                 "id": s["id"], "name": s["name"], "cat": s["cat"],
                 "icon": s["icon"], "color": s["color"], "desc": s["desc"],
-                "port": s["port"], "path": s["path"], "scheme": s.get("scheme", "http"),
+                "port": s["port"], "path": s["path"],
+                "scheme": st.get("scheme", s.get("scheme", "http")),
                 "restartable": bool(s.get("restart")),
                 "status": st["status"], "latency_ms": st["latency_ms"],
                 "since": st["since"], "restarts": st["restarts"],
