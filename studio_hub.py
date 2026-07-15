@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BoxDash — one page for every service on this box + a quiet watchdog.
+"""Mac Mini Board — one page for every service on this box + a quiet watchdog.
 
 A single watchdog thread is the source of truth: it polls each service on an
 interval, applies a fail-grace so brief blips don't flap, auto-restarts a downed
@@ -88,7 +88,7 @@ SERVICES = [
     {"id": "music", "name": "Music Studio", "cat": "Studios", "icon": "♫", "color": "#34d399",
      "port": 8191, "path": "/", "check_host": "127.0.0.1", "check_path": "/",
      "restart": RUN_COMFY, "desc": "Stems, generation, mastering"},
-    {"id": "hub", "name": "BoxDash", "cat": "Studios", "icon": "◧", "color": "#60a5fa",
+    {"id": "hub", "name": "Mac Mini Board", "cat": "Studios", "icon": "◧", "color": "#60a5fa",
      "port": PORT, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/ping",
      "restart": None, "desc": "This dashboard (self)"},
     {"id": "magic", "name": "Magic", "cat": "Apps", "icon": "✦", "color": "#c084fc",
@@ -338,7 +338,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BoxDash</title>
+<title>Mac Mini Board</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2306080c'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%2337e6d4'/%3E%3Ccircle cx='32' cy='32' r='14' fill='none' stroke='%2337e6d4' stroke-width='2.5' opacity='0.6'/%3E%3Ccircle cx='32' cy='32' r='22' fill='none' stroke='%2337e6d4' stroke-width='2' opacity='0.28'/%3E%3C/svg%3E">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -444,7 +444,7 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 <canvas id="wave"></canvas>
 <div class="wrap">
   <div class="head">
-    <div class="brand"><div class="glyph">◧</div><h1>Box<span>Dash</span></h1></div>
+    <div class="brand"><div class="glyph">◧</div><h1>Mac Mini<span> Board</span></h1></div>
     <span class="pill"><b id="pill-up">–</b> <span id="pill-tot">/ –</span> up</span>
     <div class="sp"></div>
     <div class="tick"><i></i><span id="tick">live · 5s</span></div>
@@ -752,6 +752,6 @@ class ThreadingHTTPServer(HTTPServer):
 if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[+] BoxDash → http://{BOX_IP}:{PORT}  (watchdog: "
+    print(f"[+] Mac Mini Board → http://{BOX_IP}:{PORT}  (watchdog: "
           f"{'auto-restart' if AUTO_RESTART else 'alert-only'}, poll {POLL_INTERVAL}s)")
     server.serve_forever()
