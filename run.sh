@@ -72,7 +72,11 @@ fi
 
 echo "[+] Starting ComfyUI backend on $BACKEND_HOST:$PORT"
 echo "[+] Logs: $LOG_DIR"
-args=(main.py --listen "$BACKEND_HOST" --port "$PORT" --cache-none --preview-method none)
+# fp16 attention overflows to NaN on Apple MPS for Wan video models (glowing-blob
+# output). Force fp32 + split cross-attention for numerically stable video decode.
+# Dropped --cache-none so the 17GB model set isn't reloaded from disk every job.
+args=(main.py --listen "$BACKEND_HOST" --port "$PORT" --preview-method none \
+      --force-fp32 --use-split-cross-attention)
 if [[ "$DEBUG" == 1 ]]; then args+=(--verbose DEBUG); fi
 cd "$COMFY"
 exec "$PYTHON" "${args[@]}"

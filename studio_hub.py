@@ -97,16 +97,17 @@ SERVICES = [
     {"id": "music", "name": "Music Studio", "cat": "Studios", "icon": "♫", "color": "#34d399",
      "port": 8191, "path": "/", "check_host": "127.0.0.1", "check_path": "/",
      "restart": RUN_COMFY, "desc": "Stems, generation, mastering"},
-    {"id": "hub", "name": "Mac Mini Board", "cat": "Studios", "icon": "◧", "color": "#60a5fa",
-     "port": PORT, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/ping",
-     "restart": None, "desc": "This dashboard (self)"},
+    {"id": "facefusion", "name": "Face Studio", "cat": "Studios", "icon": "☺", "color": "#f472b6",
+     "port": 7860, "path": "/", "check_host": "127.0.0.1", "check_path": "/",
+     "restart": ["/bin/bash", str(Path.home() / "AI/facefusion/run.sh")],
+     "desc": "Face swap (consenting subjects)"},
     {"id": "magic", "name": "Magic", "cat": "Apps", "icon": "✦", "color": "#c084fc",
      "port": 8443, "path": "/", "scheme": "https", "check_host": "127.0.0.1",
      "check_path": "/", "restart": None, "desc": "Magic app"},
     {"id": "cockpit", "name": "Adam's Cockpit", "cat": "Apps", "icon": "❤", "color": "#fb7185",
-     "port": 8787, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/status",
+     "port": 8787, "path": "/mdr", "check_host": "127.0.0.1", "check_path": "/mdr",
      "restart": ["/bin/bash", str(Path.home() / "Apps/adam-cockpit/run.sh")],
-     "desc": "Personal health cockpit"},
+     "desc": "Personal health cockpit (MDR)"},
 ]
 
 SERVICE_BY_ID = {s["id"]: s for s in SERVICES}
@@ -188,9 +189,9 @@ def attempt_restart(svc):
 
 
 def sample_cpu_and_procs(n=8):
-    """One 0.5s window: accurate per-core CPU + top processes (needs psutil)."""
+    """One 0.5s window: per-core CPU + top procs by CPU and by memory (psutil)."""
     if psutil is None:
-        return None, []
+        return None, [], []
     procs = list(psutil.process_iter(["name"]))
     for p in procs:
         try:
@@ -207,8 +208,9 @@ def sample_cpu_and_procs(n=8):
                          "cpu": round(cpu, 1), "mem": p.memory_info().rss})
         except Exception:
             pass
-    rows.sort(key=lambda r: r["cpu"], reverse=True)
-    return [round(c, 1) for c in percpu], rows[:n]
+    top_cpu = sorted(rows, key=lambda r: r["cpu"], reverse=True)[:n]
+    top_mem = sorted(rows, key=lambda r: r["mem"], reverse=True)[:n]
+    return [round(c, 1) for c in percpu], top_cpu, top_mem
 
 
 def read_box_stats():
@@ -246,13 +248,23 @@ def read_box_stats():
         uptime_s = int(time.time() - sec)
     except Exception:
         pass
-    cpu_cores, top = sample_cpu_and_procs()
+    cpu_cores, top, top_mem = sample_cpu_and_procs()
     swap_used = swap_total = None
     net_rx = net_tx = None
+    mem_detail = None
     if psutil is not None:
         try:
             sw = psutil.swap_memory()
             swap_used, swap_total = sw.used, sw.total
+        except Exception:
+            pass
+        try:
+            vm = psutil.virtual_memory()
+            mem_detail = {k: getattr(vm, k) for k in
+                          ("total", "available", "used", "free", "active",
+                           "inactive", "wired") if hasattr(vm, k)}
+            mem_total = vm.total
+            mem_free = vm.available
         except Exception:
             pass
         try:
@@ -270,9 +282,9 @@ def read_box_stats():
         "cpus": os.cpu_count(),
         "cpu_cores": cpu_cores,
         "cpu_pct": round(sum(cpu_cores) / len(cpu_cores), 1) if cpu_cores else None,
-        "top": top,
+        "top": top, "top_mem": top_mem,
         "disk_total": du.total, "disk_free": du.free,
-        "mem_total": mem_total, "mem_free": mem_free,
+        "mem_total": mem_total, "mem_free": mem_free, "mem_detail": mem_detail,
         "swap_used": swap_used, "swap_total": swap_total,
         "net_rx": net_rx, "net_tx": net_tx,
         "uptime_s": uptime_s,
@@ -477,8 +489,20 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 
 /* vitals */
 .vitals{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:11px;margin-bottom:6px}
-.vital{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:13px;padding:13px 15px}
-.vital .k{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin-bottom:5px}
+.vital{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:13px;padding:13px 15px;cursor:pointer;transition:border-color .15s,transform .1s;position:relative}
+.vital:hover{border-color:var(--line2)}
+.vital.active{border-color:var(--accent)}
+.vital.active::after{content:"";position:absolute;left:50%;bottom:-7px;width:12px;height:12px;background:var(--panel2);border-left:1px solid var(--accent);border-top:1px solid var(--accent);transform:translateX(-50%) rotate(45deg)}
+.vital .k{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin-bottom:5px;display:flex;justify-content:space-between}
+.vital .k .caret{opacity:.4;transition:transform .2s}
+.vital.active .k .caret{transform:rotate(180deg);opacity:.9;color:var(--accent)}
+/* collapsible vital detail */
+.vdetail{overflow:hidden;max-height:0;opacity:0;transition:max-height .3s ease,opacity .2s,margin .3s}
+.vdetail.open{max-height:700px;opacity:1;margin:2px 0 8px}
+.vdetail-inner{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--accent);border-radius:13px;padding:16px 18px}
+.vdetail h3{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3);margin-bottom:10px}
+.vd-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:640px){.vd-grid{grid-template-columns:1fr}}
 .vital .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
 .vital .v small{font-size:12px;color:var(--ink2);font-weight:400}
 .meter{height:4px;border-radius:3px;background:#0a0e14;margin-top:9px;overflow:hidden}
@@ -594,6 +618,7 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
   </div>
 
   <div class="vitals" id="vitals"></div>
+  <div class="vdetail" id="vdetail"><div class="vdetail-inner" id="vdetail-inner"></div></div>
 
   <div class="stage-wrap">
     <div class="stage-title"><h2>Services</h2><span class="hint">← → scroll · click to open</span></div>
@@ -799,11 +824,8 @@ async function openDetail(s){
   }catch(e){document.getElementById("d-body").innerHTML='<div class="d-sub">could not load detail</div>';}
 }
 function renderDetail(d){
-  const b=window.__box||{};
   const s=d.service,p=d.proc;
   document.getElementById("d-restart").style.display=s.restartable?"":"none";
-  const memUsed=(b.mem_total&&b.mem_free)?b.mem_total-b.mem_free:null;
-  const swapPct=(b.swap_total)?Math.round((b.swap_used||0)/b.swap_total*100):0;
   const procBlock=p?`<div class="kv">
       <span class="k">pid</span><span class="v">${p.pid}</span>
       <span class="k">cpu</span><span class="v">${p.cpu}%</span>
@@ -818,20 +840,11 @@ function renderDetail(d){
   document.getElementById("d-body").innerHTML=`
     <div class="d-sec"><h3>Status · ${s.status}</h3>
       <div class="kv"><span class="k">latency</span><span class="v">${(d.hist.slice(-1)[0]??"–")} ms</span>
-      <span class="k">restarts</span><span class="v">${s.restarts}</span></div>
+      <span class="k">restarts</span><span class="v">${s.restarts}</span>
+      <span class="k">endpoint</span><span class="v">${s.scheme}://…:${s.port}</span></div>
       ${sparkline(d.hist)}
     </div>
     <div class="d-sec"><h3>Process</h3>${procBlock}</div>
-    <div class="d-sec"><h3>System · CPU ${b.cpu_pct??"–"}%</h3>
-      ${coreBars(b.cpu_cores)}
-      <div class="gauges">
-        <div class="gauge"><div class="gk">Memory</div><div class="gv">${fmtBytes(memUsed)} <small>/ ${fmtBytes(b.mem_total)}</small></div></div>
-        <div class="gauge"><div class="gk">Swap</div><div class="gv">${fmtBytes(b.swap_used)} <small>${swapPct}%</small></div></div>
-        <div class="gauge"><div class="gk">Net ↓</div><div class="gv">${fmtBytes(b.net_rx)}<small>/s</small></div></div>
-        <div class="gauge"><div class="gk">Net ↑</div><div class="gv">${fmtBytes(b.net_tx)}<small>/s</small></div></div>
-      </div>
-    </div>
-    <div class="d-sec"><h3>Top processes</h3>${procRows(b.top,b.cpus)}</div>
     <div class="d-sec"><h3>Recent events</h3>${evBlock}</div>`;
 }
 function closeDetail(){detailSvc=null;document.getElementById("scrim").classList.remove("open");document.getElementById("detail").classList.remove("open");}
@@ -861,12 +874,83 @@ function renderVitals(b,up,tot){
   const diskPct=diskUsed?Math.round(diskUsed/b.disk_total*100):0;
   const loadPct=(b.load&&b.cpus)?Math.min(100,Math.round(b.load[0]/b.cpus*100)):0;
   const cls=p=>p>=90?"crit":p>=70?"hot":"";
+  const A=k=>openVital===k?" active":"";
+  const car='<span class="caret">▾</span>';
   document.getElementById("vitals").innerHTML=`
-    <div class="vital"><div class="k">Services</div><div class="v">${up}<small> / ${tot} up</small></div><div class="meter"><span class="${up<tot?'hot':''}" style="width:${tot?up/tot*100:0}%"></span></div></div>
-    <div class="vital"><div class="k">Load 1m</div><div class="v">${b.load?b.load[0]:"–"}<small> · ${b.cpus||"?"} cpu</small></div><div class="meter"><span class="${cls(loadPct)}" style="width:${loadPct}%"></span></div></div>
-    <div class="vital"><div class="k">Memory</div><div class="v">${fmtBytes(memUsed)}<small> / ${fmtBytes(b.mem_total)}</small></div><div class="meter"><span class="${cls(memPct)}" style="width:${memPct}%"></span></div></div>
-    <div class="vital"><div class="k">Disk free</div><div class="v">${fmtBytes(b.disk_free)}<small> / ${fmtBytes(b.disk_total)}</small></div><div class="meter"><span class="${cls(diskPct)}" style="width:${diskPct}%"></span></div></div>
-    <div class="vital"><div class="k">Uptime</div><div class="v">${fmtDur(b.uptime_s)}</div></div>`;
+    <div class="vital${A('services')}" onclick="toggleVital('services')"><div class="k">Services ${car}</div><div class="v">${up}<small> / ${tot} up</small></div><div class="meter"><span class="${up<tot?'hot':''}" style="width:${tot?up/tot*100:0}%"></span></div></div>
+    <div class="vital${A('load')}" onclick="toggleVital('load')"><div class="k">Load 1m ${car}</div><div class="v">${b.load?b.load[0]:"–"}<small> · ${b.cpus||"?"} cpu</small></div><div class="meter"><span class="${cls(loadPct)}" style="width:${loadPct}%"></span></div></div>
+    <div class="vital${A('memory')}" onclick="toggleVital('memory')"><div class="k">Memory ${car}</div><div class="v">${fmtBytes(memUsed)}<small> / ${fmtBytes(b.mem_total)}</small></div><div class="meter"><span class="${cls(memPct)}" style="width:${memPct}%"></span></div></div>
+    <div class="vital${A('disk')}" onclick="toggleVital('disk')"><div class="k">Disk free ${car}</div><div class="v">${fmtBytes(b.disk_free)}<small> / ${fmtBytes(b.disk_total)}</small></div><div class="meter"><span class="${cls(diskPct)}" style="width:${diskPct}%"></span></div></div>
+    <div class="vital${A('uptime')}" onclick="toggleVital('uptime')"><div class="k">Uptime ${car}</div><div class="v">${fmtDur(b.uptime_s)}</div></div>`;
+  syncVitalDetail();
+}
+let openVital=null;
+function toggleVital(k){openVital=(openVital===k)?null:k;
+  document.querySelectorAll(".vital").forEach(el=>el.classList.remove("active"));
+  syncVitalDetail();
+  // re-mark active tile
+  const idx={services:0,load:1,memory:2,disk:3,uptime:4}[openVital];
+  if(idx!=null)document.querySelectorAll(".vital")[idx]?.classList.add("active");
+}
+function procRowsMem(top){
+  if(!top||!top.length)return '<div class="d-sub">–</div>';
+  return `<table class="proc-tbl"><thead><tr><th>process</th><th style="text-align:right">mem</th><th style="text-align:right">cpu%</th></tr></thead><tbody>
+    ${top.map(p=>`<tr><td class="n" title="pid ${p.pid}">${p.name}</td><td class="num">${fmtBytes(p.mem)}</td><td class="num">${p.cpu.toFixed(1)}</td></tr>`).join("")}</tbody></table>`;
+}
+function syncVitalDetail(){
+  const wrap=document.getElementById("vdetail");
+  if(!openVital){wrap.classList.remove("open");return;}
+  wrap.classList.add("open");
+  document.getElementById("vdetail-inner").innerHTML=renderVitalDetail(openVital,window.__box||{});
+}
+function renderVitalDetail(kind,b){
+  if(kind==="services"){
+    const rows=SVCS.map(s=>`<tr><td class="n"><span class="dot ${s.status}" style="display:inline-block;margin-right:7px"></span>${s.name}</td><td class="num st-${s.status}">${s.status}</td><td class="num">${s.latency_ms!=null?s.latency_ms+"ms":"–"}</td></tr>`).join("");
+    return `<h3>All services · ${SVCS.filter(s=>s.status==="online").length}/${SVCS.length} up</h3>
+      <table class="proc-tbl"><thead><tr><th>service</th><th style="text-align:right">status</th><th style="text-align:right">latency</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  if(kind==="load"){
+    return `<h3>CPU ${b.cpu_pct??"–"}% · load ${(b.load||[]).join(" / ")||"–"} · ${b.cpus||"?"} cores</h3>
+      <div class="vd-grid"><div>${coreBars(b.cpu_cores)}</div>
+      <div><h3>Top by CPU</h3>${procRows(b.top,b.cpus)}</div></div>`;
+  }
+  if(kind==="memory"){
+    const m=b.mem_detail||{};const g=k=>m[k]!=null?fmtBytes(m[k]):"–";
+    const swapPct=b.swap_total?Math.round((b.swap_used||0)/b.swap_total*100):0;
+    return `<h3>Memory breakdown</h3>
+      <div class="vd-grid">
+        <div class="kv">
+          <span class="k">total</span><span class="v">${g("total")}</span>
+          <span class="k">used</span><span class="v">${g("used")}</span>
+          <span class="k">available</span><span class="v">${g("available")}</span>
+          <span class="k">wired</span><span class="v">${g("wired")}</span>
+          <span class="k">active</span><span class="v">${g("active")}</span>
+          <span class="k">inactive</span><span class="v">${g("inactive")}</span>
+          <span class="k">free</span><span class="v">${g("free")}</span>
+          <span class="k">swap</span><span class="v">${fmtBytes(b.swap_used)} / ${fmtBytes(b.swap_total)} (${swapPct}%)</span>
+        </div>
+        <div><h3>Top by memory</h3>${procRowsMem(b.top_mem)}</div>
+      </div>`;
+  }
+  if(kind==="disk"){
+    const used=(b.disk_total&&b.disk_free)?b.disk_total-b.disk_free:null;
+    const pct=used?Math.round(used/b.disk_total*100):0;
+    const cl=pct>=90?"crit":pct>=70?"hot":"";
+    return `<h3>Disk · / volume</h3>
+      <div class="kv"><span class="k">total</span><span class="v">${fmtBytes(b.disk_total)}</span>
+      <span class="k">used</span><span class="v">${fmtBytes(used)} (${pct}%)</span>
+      <span class="k">free</span><span class="v">${fmtBytes(b.disk_free)}</span></div>
+      <div class="meter" style="height:8px;margin-top:12px"><span class="${cl}" style="width:${pct}%"></span></div>`;
+  }
+  if(kind==="uptime"){
+    const boot=b.uptime_s!=null?new Date(Date.now()-b.uptime_s*1000).toLocaleString():"–";
+    return `<h3>Uptime</h3>
+      <div class="kv"><span class="k">up for</span><span class="v">${fmtDur(b.uptime_s)}</span>
+      <span class="k">booted</span><span class="v">${boot}</span>
+      <span class="k">load 1/5/15</span><span class="v">${(b.load||[]).join(" / ")||"–"}</span>
+      <span class="k">services up</span><span class="v">${SVCS.filter(s=>s.status==="online").length} / ${SVCS.length}</span></div>`;
+  }
+  return "";
 }
 function renderEvents(events){
   const ev=document.getElementById("events");
