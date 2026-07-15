@@ -18,9 +18,15 @@ import threading
 import time
 import urllib.request
 import mimetypes
+from collections import deque
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 PORT = 8189
 COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path(__file__).resolve().parent))
@@ -76,6 +82,9 @@ SERVICES = [
     {"id": "ollama", "name": "Ollama", "cat": "AI", "icon": "🦙", "color": "#7c6ff7",
      "port": 11434, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/version",
      "restart": ["brew", "services", "restart", "ollama"], "desc": "Local LLM runtime"},
+    {"id": "openwebui", "name": "Open WebUI", "cat": "AI", "icon": "◲", "color": "#38bdf8",
+     "port": 8081, "path": "/", "check_host": "127.0.0.1", "check_path": "/",
+     "restart": None, "desc": "Chat UI for local models"},
     {"id": "comfyui", "name": "ComfyUI", "cat": "AI", "icon": "⚙", "color": "#fbbf24",
      "port": 8188, "path": "/", "check_host": "127.0.0.1", "check_path": "/system_stats",
      "restart": RUN_COMFY, "desc": "Diffusion backend"},
@@ -93,7 +102,11 @@ SERVICES = [
      "restart": None, "desc": "This dashboard (self)"},
     {"id": "magic", "name": "Magic", "cat": "Apps", "icon": "✦", "color": "#c084fc",
      "port": 8443, "path": "/", "scheme": "https", "check_host": "127.0.0.1",
-     "check_path": "/", "restart": None, "desc": "Magic app (https)"},
+     "check_path": "/", "restart": None, "desc": "Magic app"},
+    {"id": "cockpit", "name": "Adam's Cockpit", "cat": "Apps", "icon": "❤", "color": "#fb7185",
+     "port": 8787, "path": "/", "check_host": "127.0.0.1", "check_path": "/api/status",
+     "restart": ["/bin/bash", str(Path.home() / "Apps/adam-cockpit/run.sh")],
+     "desc": "Personal health cockpit"},
 ]
 
 SERVICE_BY_ID = {s["id"]: s for s in SERVICES}
@@ -103,10 +116,11 @@ state_lock = threading.Lock()
 STATE = {
     s["id"]: {"status": "unknown", "fails": 0, "latency_ms": None,
               "since": time.time(), "restarts": 0, "last_restart": 0.0,
-              "scheme": s.get("scheme", "http")}
+              "scheme": s.get("scheme", "http"), "hist": deque(maxlen=60)}
     for s in SERVICES
 }
 BOX = {}
+_net_prev = None  # (ts, bytes_recv, bytes_sent) for network rate
 
 
 def _now_iso():
@@ -173,7 +187,32 @@ def attempt_restart(svc):
         return False
 
 
+def sample_cpu_and_procs(n=8):
+    """One 0.5s window: accurate per-core CPU + top processes (needs psutil)."""
+    if psutil is None:
+        return None, []
+    procs = list(psutil.process_iter(["name"]))
+    for p in procs:
+        try:
+            p.cpu_percent(None)  # prime
+        except Exception:
+            pass
+    percpu = psutil.cpu_percent(interval=0.5, percpu=True)
+    ncpu = len(percpu) or 1
+    rows = []
+    for p in procs:
+        try:
+            cpu = p.cpu_percent(None) / ncpu  # normalize to whole-machine %
+            rows.append({"pid": p.pid, "name": (p.info.get("name") or "?")[:22],
+                         "cpu": round(cpu, 1), "mem": p.memory_info().rss})
+        except Exception:
+            pass
+    rows.sort(key=lambda r: r["cpu"], reverse=True)
+    return [round(c, 1) for c in percpu], rows[:n]
+
+
 def read_box_stats():
+    global _net_prev
     load1, load5, load15 = os.getloadavg()
     du = shutil.disk_usage("/")
     mem_total = None
@@ -207,11 +246,35 @@ def read_box_stats():
         uptime_s = int(time.time() - sec)
     except Exception:
         pass
+    cpu_cores, top = sample_cpu_and_procs()
+    swap_used = swap_total = None
+    net_rx = net_tx = None
+    if psutil is not None:
+        try:
+            sw = psutil.swap_memory()
+            swap_used, swap_total = sw.used, sw.total
+        except Exception:
+            pass
+        try:
+            now = time.time()
+            io = psutil.net_io_counters()
+            if _net_prev:
+                dt = max(0.1, now - _net_prev[0])
+                net_rx = int((io.bytes_recv - _net_prev[1]) / dt)
+                net_tx = int((io.bytes_sent - _net_prev[2]) / dt)
+            _net_prev = (now, io.bytes_recv, io.bytes_sent)
+        except Exception:
+            pass
     return {
         "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
         "cpus": os.cpu_count(),
+        "cpu_cores": cpu_cores,
+        "cpu_pct": round(sum(cpu_cores) / len(cpu_cores), 1) if cpu_cores else None,
+        "top": top,
         "disk_total": du.total, "disk_free": du.free,
         "mem_total": mem_total, "mem_free": mem_free,
+        "swap_used": swap_used, "swap_total": swap_total,
+        "net_rx": net_rx, "net_tx": net_tx,
         "uptime_s": uptime_s,
     }
 
@@ -226,6 +289,7 @@ def watchdog_loop():
                 st = STATE[sid]
                 prev = st["status"]
                 st["latency_ms"] = latency
+                st["hist"].append(latency if latency is not None else 0)
                 if ok:
                     st["scheme"] = scheme
                 if ok:
@@ -313,6 +377,49 @@ def recent_media(limit=18):
                               "mtime": f.stat().st_mtime})
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items[:limit]
+
+
+def pid_on_port(port):
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL).decode().split()
+        return int(out[0]) if out else None
+    except Exception:
+        return None
+
+
+def service_detail(sid):
+    svc = SERVICE_BY_ID.get(sid)
+    if not svc:
+        return {"error": "unknown service"}
+    with state_lock:
+        st = STATE[sid]
+        hist = list(st["hist"])
+        info = {"id": sid, "name": svc["name"], "cat": svc["cat"], "desc": svc["desc"],
+                "port": svc["port"], "status": st["status"], "scheme": st.get("scheme", "http"),
+                "restarts": st["restarts"], "since": st["since"],
+                "restartable": bool(svc.get("restart"))}
+    proc = None
+    pid = pid_on_port(svc["port"])
+    if pid and psutil is not None:
+        try:
+            p = psutil.Process(pid)
+            with p.oneshot():
+                ncpu = psutil.cpu_count() or 1
+                proc = {
+                    "pid": pid,
+                    "name": p.name(),
+                    "cpu": round(p.cpu_percent(interval=0.3) / ncpu, 1),
+                    "mem": p.memory_info().rss,
+                    "threads": p.num_threads(),
+                    "uptime_s": int(time.time() - p.create_time()),
+                    "cmd": " ".join(p.cmdline()[:4])[:120],
+                }
+        except Exception:
+            proc = None
+    events = [e for e in recent_events(200) if e.get("service") == sid][:12]
+    return {"service": info, "proc": proc, "hist": hist, "events": events}
 
 
 def services_payload():
@@ -438,6 +545,42 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .media img,.media video{width:100%;height:100%;object-fit:cover;display:block}
 .media .aud{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;background:linear-gradient(135deg,#0d2b21,#0a1a14)}
 @media(prefers-reduced-motion:reduce){.cf{transition:none}.tick i,.dot.restarting{animation:none}}
+
+/* ---- btop-style detail drawer ---- */
+#scrim{position:fixed;inset:0;z-index:40;background:rgba(3,5,8,.72);backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:opacity .2s}
+#scrim.open{opacity:1;pointer-events:auto}
+#detail{position:fixed;top:0;right:0;bottom:0;z-index:41;width:min(560px,94vw);background:var(--bg);border-left:1px solid var(--line2);
+  transform:translateX(100%);transition:transform .28s cubic-bezier(.22,1,.36,1);display:flex;flex-direction:column;box-shadow:-30px 0 80px rgba(0,0,0,.6)}
+#detail.open{transform:none}
+.d-head{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
+.d-ic{width:40px;height:40px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.d-ttl{font-size:17px;font-weight:800}
+.d-sub{font-family:var(--mono);font-size:11px;color:var(--ink3)}
+.d-head .sp{flex:1}
+.d-btn{font-family:var(--mono);font-size:12px;padding:6px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--panel);color:var(--ink);cursor:pointer;transition:all .15s}
+.d-btn:hover{border-color:var(--accent);color:var(--accent)}
+.d-btn.warn:hover{border-color:var(--warn);color:var(--warn)}
+.d-body{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:18px}
+.d-sec h3{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink3);margin-bottom:9px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;font-family:var(--mono);font-size:12px}
+.kv .k{color:var(--ink3)}.kv .v{color:var(--ink);text-align:right;font-variant-numeric:tabular-nums}
+.spark{width:100%;height:44px;display:block}
+.cores{display:grid;grid-template-columns:repeat(auto-fit,minmax(60px,1fr));gap:6px}
+.core{font-family:var(--mono);font-size:10px;color:var(--ink3)}
+.core .cbar{height:5px;border-radius:3px;background:#0a0e14;margin-top:3px;overflow:hidden}
+.core .cbar>span{display:block;height:100%;background:var(--ok)}
+.core .cbar>span.hot{background:var(--warn)}.core .cbar>span.crit{background:var(--crit)}
+.gauges{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.gauge{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.gauge .gk{font-family:var(--mono);font-size:10px;color:var(--ink3);text-transform:uppercase;letter-spacing:.08em}
+.gauge .gv{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
+.gauge .gv small{font-size:11px;color:var(--ink2);font-weight:400}
+.proc-tbl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px}
+.proc-tbl th{text-align:left;color:var(--ink3);font-weight:600;padding:3px 0;border-bottom:1px solid var(--line)}
+.proc-tbl td{padding:3px 0;border-bottom:1px solid var(--line);color:var(--ink2)}
+.proc-tbl td.n{color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.proc-tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
+.proc-tbl .cpuhot{color:var(--warn)}.proc-tbl .cpucrit{color:var(--crit)}
 </style>
 </head>
 <body>
@@ -473,6 +616,19 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
     </div>
   </div>
 </div>
+
+<div id="scrim" onclick="closeDetail()"></div>
+<aside id="detail" aria-label="Service detail">
+  <div class="d-head">
+    <div class="d-ic" id="d-ic"></div>
+    <div><div class="d-ttl" id="d-ttl">–</div><div class="d-sub" id="d-sub"></div></div>
+    <div class="sp"></div>
+    <button class="d-btn" id="d-open" onclick="openFromDetail()">Open ↗</button>
+    <button class="d-btn warn" id="d-restart" onclick="restartFromDetail()" style="display:none">Restart</button>
+    <button class="d-btn" onclick="closeDetail()">✕</button>
+  </div>
+  <div class="d-body" id="d-body"></div>
+</aside>
 
 <script>
 const CATS=["Media","Downloads","AI","Studios","Apps"];
@@ -581,7 +737,7 @@ function buildFlow(){
           <span class="port">:${s.port}</span>
         </div>
       </div>`;
-    el.onclick=()=>{ if(i===center){openSvc(s);} else {center=i;layout();} };
+    el.onclick=()=>{ if(i===center){openDetail(s);} else {center=i;layout();} };
     flow.appendChild(el);
   });
   const dots=document.getElementById("dots");dots.innerHTML="";
@@ -603,11 +759,95 @@ function layout(){
   document.querySelectorAll(".dots i").forEach((d,i)=>d.className=i===center?"on":"");
 }
 function openSvc(s){ if(s.id==="hub")return; const url=`${s.scheme}://${location.hostname}:${s.port}${s.path}`; window.open(url,"_blank"); }
+
+/* ---------- btop-style detail drawer ---------- */
+let detailSvc=null;
+function sparkline(hist){
+  if(!hist||!hist.length)return '<div class="d-sub">no samples yet</div>';
+  const max=Math.max(10,...hist),W=520,H=44,n=hist.length;
+  const pts=hist.map((v,i)=>`${(i/(n-1||1)*W).toFixed(1)},${(H-2-v/max*(H-6)).toFixed(1)}`).join(" ");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+    <polyline points="0,${H} ${pts} ${W},${H}" fill="var(--accent)" fill-opacity=".08" stroke="none"/></svg>`;
+}
+function coreBars(cores){
+  if(!cores||!cores.length)return "";
+  return `<div class="cores">${cores.map((c,i)=>{const cl=c>=85?"crit":c>=55?"hot":"";
+    return `<div class="core">c${i} ${c.toFixed(0)}%<div class="cbar"><span class="${cl}" style="width:${Math.min(100,c)}%"></span></div></div>`;}).join("")}</div>`;
+}
+function procRows(top,ncpu){
+  if(!top||!top.length)return "";
+  return `<table class="proc-tbl"><thead><tr><th>process</th><th style="text-align:right">cpu%</th><th style="text-align:right">mem</th></tr></thead><tbody>
+    ${top.map(p=>{const cl=p.cpu>=50?"cpucrit":p.cpu>=20?"cpuhot":"";
+      return `<tr><td class="n" title="pid ${p.pid}">${p.name}</td><td class="num ${cl}">${p.cpu.toFixed(1)}</td><td class="num">${fmtBytes(p.mem)}</td></tr>`;}).join("")}
+    </tbody></table>`;
+}
+async function openDetail(s){
+  detailSvc=s;
+  document.getElementById("d-ic").style.background=s.color+"22";
+  document.getElementById("d-ic").style.color=s.color;
+  document.getElementById("d-ic").textContent=s.icon;
+  document.getElementById("d-ttl").textContent=s.name;
+  document.getElementById("d-sub").textContent=`${s.cat} · ${s.scheme}://…:${s.port}`;
+  document.getElementById("d-open").style.display=s.id==="hub"?"none":"";
+  document.getElementById("scrim").classList.add("open");
+  document.getElementById("detail").classList.add("open");
+  document.getElementById("d-body").innerHTML='<div class="d-sub">loading…</div>';
+  try{
+    const d=await(await fetch("/api/detail?id="+encodeURIComponent(s.id))).json();
+    renderDetail(d);
+  }catch(e){document.getElementById("d-body").innerHTML='<div class="d-sub">could not load detail</div>';}
+}
+function renderDetail(d){
+  const b=window.__box||{};
+  const s=d.service,p=d.proc;
+  document.getElementById("d-restart").style.display=s.restartable?"":"none";
+  const memUsed=(b.mem_total&&b.mem_free)?b.mem_total-b.mem_free:null;
+  const swapPct=(b.swap_total)?Math.round((b.swap_used||0)/b.swap_total*100):0;
+  const procBlock=p?`<div class="kv">
+      <span class="k">pid</span><span class="v">${p.pid}</span>
+      <span class="k">cpu</span><span class="v">${p.cpu}%</span>
+      <span class="k">memory</span><span class="v">${fmtBytes(p.mem)}</span>
+      <span class="k">threads</span><span class="v">${p.threads}</span>
+      <span class="k">uptime</span><span class="v">${fmtDur(p.uptime_s)}</span>
+      <span class="k">command</span><span class="v" style="text-align:left;word-break:break-all">${p.cmd||"–"}</span>
+    </div>`:`<div class="d-sub">no local process on :${s.port} (remote or app-managed)</div>`;
+  const evBlock=d.events&&d.events.length?d.events.map(e=>{
+    const t=(e.ts||"").replace("T"," ").replace("Z","").slice(5,16);
+    return `<div class="ev"><span class="et">${t}</span><span class="ek ${e.event}">${e.event.replace(/_/g," ")}</span><span class="ed">${e.detail||""}</span></div>`;}).join(""):'<div class="d-sub">no events for this service</div>';
+  document.getElementById("d-body").innerHTML=`
+    <div class="d-sec"><h3>Status · ${s.status}</h3>
+      <div class="kv"><span class="k">latency</span><span class="v">${(d.hist.slice(-1)[0]??"–")} ms</span>
+      <span class="k">restarts</span><span class="v">${s.restarts}</span></div>
+      ${sparkline(d.hist)}
+    </div>
+    <div class="d-sec"><h3>Process</h3>${procBlock}</div>
+    <div class="d-sec"><h3>System · CPU ${b.cpu_pct??"–"}%</h3>
+      ${coreBars(b.cpu_cores)}
+      <div class="gauges">
+        <div class="gauge"><div class="gk">Memory</div><div class="gv">${fmtBytes(memUsed)} <small>/ ${fmtBytes(b.mem_total)}</small></div></div>
+        <div class="gauge"><div class="gk">Swap</div><div class="gv">${fmtBytes(b.swap_used)} <small>${swapPct}%</small></div></div>
+        <div class="gauge"><div class="gk">Net ↓</div><div class="gv">${fmtBytes(b.net_rx)}<small>/s</small></div></div>
+        <div class="gauge"><div class="gk">Net ↑</div><div class="gv">${fmtBytes(b.net_tx)}<small>/s</small></div></div>
+      </div>
+    </div>
+    <div class="d-sec"><h3>Top processes</h3>${procRows(b.top,b.cpus)}</div>
+    <div class="d-sec"><h3>Recent events</h3>${evBlock}</div>`;
+}
+function closeDetail(){detailSvc=null;document.getElementById("scrim").classList.remove("open");document.getElementById("detail").classList.remove("open");}
+function openFromDetail(){if(detailSvc)openSvc(detailSvc);}
+async function restartFromDetail(){
+  if(!detailSvc)return;
+  const btn=document.getElementById("d-restart");btn.textContent="Restarting…";btn.disabled=true;
+  try{await fetch("/api/restart?id="+encodeURIComponent(detailSvc.id),{method:"POST"});}catch(e){}
+  setTimeout(()=>{btn.textContent="Restart";btn.disabled=false;if(detailSvc)openDetail(detailSvc);},1500);
+}
 function move(dir){ center=Math.max(0,Math.min(SVCS.length-1,center+dir)); layout(); }
 document.getElementById("fprev").onclick=()=>move(-1);
 document.getElementById("fnext").onclick=()=>move(1);
 addEventListener("keydown",e=>{if(e.key==="ArrowLeft")move(-1);if(e.key==="ArrowRight")move(1);
-  if(e.key==="Enter"&&SVCS[center])openSvc(SVCS[center]);});
+  if(e.key==="Escape"){closeDetail();return;}
+  if(e.key==="Enter"&&SVCS[center])openDetail(SVCS[center]);});
 let wheelLock=0;
 document.getElementById("stage").addEventListener("wheel",e=>{e.preventDefault();
   const now=Date.now();if(now-wheelLock<220)return;wheelLock=now;move(e.deltaY>0||e.deltaX>0?1:-1);},{passive:false});
@@ -644,7 +884,9 @@ async function tick(){
     const up=SVCS.filter(s=>s.status==="online").length;
     document.getElementById("pill-up").textContent=up;
     document.getElementById("pill-tot").textContent="/ "+SVCS.length;
+    window.__box=d.box||{};
     renderVitals(d.box||{},up,SVCS.length);
+    if(detailSvc){const fresh=SVMAP[detailSvc.id];if(fresh)detailSvc=fresh;}
     if(document.querySelectorAll(".cf").length!==SVCS.length){center=Math.min(center,SVCS.length-1);buildFlow();}
     else{ // update status in place without rebuilding (keeps flow position)
       document.querySelectorAll(".cf").forEach((el,i)=>{
@@ -704,6 +946,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif self.path == "/api/status":
             self._json(services_payload())
+        elif self.path.startswith("/api/detail"):
+            from urllib.parse import urlparse, parse_qs
+            sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            self._json(service_detail(sid))
         elif self.path == "/api/recent":
             self._json(recent_media())
         elif self.path.startswith("/media/"):
@@ -729,6 +975,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        if self.path.startswith("/api/restart"):
+            from urllib.parse import urlparse, parse_qs
+            sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            svc = SERVICE_BY_ID.get(sid)
+            if not svc:
+                self._json({"error": "unknown service"}, 404)
+                return
+            if not svc.get("restart"):
+                self._json({"error": "service has no restart command"}, 400)
+                return
+            log_event(sid, "restart", "manual (dashboard)")
+            ok = attempt_restart(svc)
+            with state_lock:
+                STATE[sid]["restarts"] += 1
+            self._json({"ok": ok})
         else:
             self._json({"error": "not found"}, 404)
 
