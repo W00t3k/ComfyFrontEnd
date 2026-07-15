@@ -525,6 +525,9 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .cf .cover svg{position:absolute;inset:0;width:100%;height:100%;display:block}
 .cf .cover::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 55%,var(--panel) 100%)}
 .cf .cat{position:absolute;top:11px;left:13px;z-index:2;font-family:var(--mono);font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.82);text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.cf .cf-open{position:absolute;top:9px;right:9px;z-index:3;width:28px;height:28px;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(3,5,8,.5);color:#fff;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:all .15s;backdrop-filter:blur(4px)}
+.cf.center .cf-open{opacity:1}
+.cf .cf-open:hover{border-color:var(--accent);color:var(--accent);background:rgba(3,5,8,.8)}
 .cf .body{padding:0 18px 18px;display:flex;flex-direction:column;flex:1;position:relative;z-index:2;margin-top:-6px}
 .cf .nm{font-size:19px;font-weight:800;letter-spacing:-.01em}
 .cf .ds{font-size:12px;color:var(--ink2);margin-top:3px;flex:1}
@@ -753,7 +756,8 @@ function buildFlow(){
   SVCS.forEach((s,i)=>{
     const el=document.createElement("div");el.className="cf";el.dataset.i=i;
     el.innerHTML=`
-      <div class="cover">${coverArt(s)}<span class="cat">${s.cat}</span></div>
+      <div class="cover">${coverArt(s)}<span class="cat">${s.cat}</span>
+        <button class="cf-open" title="Open ${s.name}">↗</button></div>
       <div class="body">
         <div class="nm">${s.name}</div>
         <div class="ds">${s.desc}</div>
@@ -763,6 +767,8 @@ function buildFlow(){
         </div>
       </div>`;
     el.onclick=()=>{ if(i===center){openDetail(s);} else {center=i;layout();} };
+    const ob=el.querySelector(".cf-open");
+    if(ob)ob.onclick=(e)=>{e.stopPropagation();openSvc(s);};
     flow.appendChild(el);
   });
   const dots=document.getElementById("dots");dots.innerHTML="";
@@ -839,10 +845,8 @@ function renderDetail(d){
     return `<div class="ev"><span class="et">${t}</span><span class="ek ${e.event}">${e.event.replace(/_/g," ")}</span><span class="ed">${e.detail||""}</span></div>`;}).join(""):'<div class="d-sub">no events for this service</div>';
   document.getElementById("d-body").innerHTML=`
     <div class="d-sec"><h3>Status · ${s.status}</h3>
-      <div class="kv"><span class="k">latency</span><span class="v">${(d.hist.slice(-1)[0]??"–")} ms</span>
-      <span class="k">restarts</span><span class="v">${s.restarts}</span>
+      <div class="kv"><span class="k">restarts</span><span class="v">${s.restarts}</span>
       <span class="k">endpoint</span><span class="v">${s.scheme}://…:${s.port}</span></div>
-      ${sparkline(d.hist)}
     </div>
     <div class="d-sec"><h3>Process</h3>${procBlock}</div>
     <div class="d-sec"><h3>Recent events</h3>${evBlock}</div>`;
@@ -905,9 +909,9 @@ function syncVitalDetail(){
 }
 function renderVitalDetail(kind,b){
   if(kind==="services"){
-    const rows=SVCS.map(s=>`<tr><td class="n"><span class="dot ${s.status}" style="display:inline-block;margin-right:7px"></span>${s.name}</td><td class="num st-${s.status}">${s.status}</td><td class="num">${s.latency_ms!=null?s.latency_ms+"ms":"–"}</td></tr>`).join("");
+    const rows=SVCS.map(s=>`<tr><td class="n"><span class="dot ${s.status}" style="display:inline-block;margin-right:7px"></span>${s.name}</td><td class="num st-${s.status}">${s.status}</td></tr>`).join("");
     return `<h3>All services · ${SVCS.filter(s=>s.status==="online").length}/${SVCS.length} up</h3>
-      <table class="proc-tbl"><thead><tr><th>service</th><th style="text-align:right">status</th><th style="text-align:right">latency</th></tr></thead><tbody>${rows}</tbody></table>`;
+      <table class="proc-tbl"><thead><tr><th>service</th><th style="text-align:right">status</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
   if(kind==="load"){
     return `<h3>CPU ${b.cpu_pct??"–"}% · load ${(b.load||[]).join(" / ")||"–"} · ${b.cpus||"?"} cores</h3>
