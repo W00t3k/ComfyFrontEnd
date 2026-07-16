@@ -1396,7 +1396,9 @@ async function activity(){
     const el=document.getElementById("activity");
     if(!items||!items.length){el.innerHTML="";return;}
     el.innerHTML=items.map(a=>{
-      const pct=Number.isFinite(a.progress)?a.progress:null;
+      // Only show a real bar once sampling reports >0; before that (model
+      // loading) show an animated indeterminate bar so it clearly reads busy.
+      const pct=(Number.isFinite(a.progress)&&a.progress>0)?a.progress:null;
       const bar=pct!=null?`<span style="width:${pct}%"></span>`:`<span class="indet"></span>`;
       const step=a.max_steps?` · ${a.step}/${a.max_steps}`:"";
       const pr=a.prompt?" · "+a.prompt.slice(0,64):"";

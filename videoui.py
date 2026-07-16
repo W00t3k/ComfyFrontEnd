@@ -310,6 +310,10 @@ header .spacer{flex:1}
 .pill{padding:6px 12px;border:1px solid var(--border);border-radius:20px;background:transparent;color:var(--text2);font-size:12px;cursor:pointer;transition:all .15s}
 .pill:hover{border-color:var(--border2);color:var(--text)}
 .pill.selected{border-color:var(--accent);color:var(--accent);background:var(--accent-glow)}
+.custom-len{display:flex;align-items:center;gap:7px;margin-top:9px;font-size:11px;color:var(--text3)}
+.custom-len input{width:74px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:5px 8px;font-size:12px}
+.custom-len input:focus{outline:none;border-color:var(--accent)}
+#len-info{color:var(--accent);margin-left:auto;font-variant-numeric:tabular-nums}
 .quality-row{display:flex;align-items:center;gap:10px}
 .quality-label{font-size:11px;color:var(--text3);white-space:nowrap}
 input[type=range]{-webkit-appearance:none;flex:1;height:3px;background:var(--border2);border-radius:3px;outline:none}
@@ -420,6 +424,11 @@ textarea#prompt::placeholder{color:var(--text3)}
     <div>
       <div class="section-label">Length · 24 fps</div>
       <div class="pill-row" id="len-list"></div>
+      <div class="custom-len">
+        <input type="number" id="len-secs" min="0.5" max="30" step="0.5" placeholder="custom">
+        <span>seconds</span>
+        <span id="len-info"></span>
+      </div>
     </div>
 
     <div>
@@ -519,8 +528,22 @@ function buildLenList() {
       document.querySelectorAll('#len-list .pill').forEach(p => p.classList.remove('selected'));
       pill.classList.add('selected');
       vidLength = frames;
+      document.getElementById('len-secs').value = '';
+      document.getElementById('len-info').textContent = '';
     };
     el.appendChild(pill);
+  });
+  const inp = document.getElementById('len-secs');
+  inp.addEventListener('input', () => {
+    const secs = parseFloat(inp.value);
+    if (!secs || secs <= 0) { document.getElementById('len-info').textContent = ''; return; }
+    // Wan needs length = 4k+1 frames; 24 fps.
+    let f = Math.round(secs * 24);
+    f = Math.round((f - 1) / 4) * 4 + 1;
+    if (f < 5) f = 5;
+    vidLength = f;
+    document.querySelectorAll('#len-list .pill').forEach(p => p.classList.remove('selected'));
+    document.getElementById('len-info').textContent = `${f} frames · ${(f / 24).toFixed(1)}s`;
   });
 }
 
@@ -943,18 +966,24 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 job["cancel_requested"] = True
                 pid = job.get("prompt_id")
-            # Drop from ComfyUI's pending queue, then interrupt if it's the live one.
+            # Interrupt the live render first (this is the one that matters), then
+            # drop it from the pending queue if it hadn't started yet. Separate
+            # try blocks: deleting a running prompt errors, and must not skip the
+            # interrupt.
             try:
-                if pid:
-                    body = json.dumps({"delete": [pid]}).encode()
-                    urllib.request.urlopen(urllib.request.Request(
-                        COMFY_URL + "/queue", data=body,
-                        headers={"Content-Type": "application/json"}), timeout=10).read()
                 urllib.request.urlopen(urllib.request.Request(
                     COMFY_URL + "/interrupt", data=b"",
                     headers={"Content-Type": "application/json"}), timeout=10).read()
             except Exception:
                 pass
+            if pid:
+                try:
+                    body = json.dumps({"delete": [pid]}).encode()
+                    urllib.request.urlopen(urllib.request.Request(
+                        COMFY_URL + "/queue", data=body,
+                        headers={"Content-Type": "application/json"}), timeout=10).read()
+                except Exception:
+                    pass
             with jobs_lock:
                 if jobs.get(job_id, {}).get("status") in ("running", "queued"):
                     jobs[job_id].update(status="cancelled", phase="Cancelled")
