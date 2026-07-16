@@ -453,6 +453,29 @@ def services_payload():
     return {"services": svcs, "box": box, "events": recent_events()}
 
 
+ACTIVITY_SOURCES = [
+    ("video", "Video Studio", "#f76f8e", "🎞", 8192),
+    ("images", "Image Studio", "#7c6ff7", "⬡", 8190),
+]
+
+
+def activity_payload():
+    out = []
+    for sid, name, color, icon, port in ACTIVITY_SOURCES:
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/activity" % port, timeout=2) as r:
+                a = json.loads(r.read())
+        except Exception:
+            continue
+        if a.get("active"):
+            out.append({"id": sid, "name": name, "color": color, "icon": icon,
+                        "phase": a.get("phase"), "progress": a.get("progress"),
+                        "step": a.get("step"), "max_steps": a.get("max_steps"),
+                        "prompt": a.get("prompt", "")})
+    return out
+
+
 def clear_events():
     try:
         EVENTS_FILE.write_text("")
@@ -822,6 +845,8 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .file-row .fn{flex:1;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .file-row .fp{color:var(--ink3);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
 .file-row .fs{color:var(--accent);font-variant-numeric:tabular-nums;flex-shrink:0}
+.del-btn{flex-shrink:0;background:none;border:1px solid var(--line2);border-radius:6px;color:var(--ink3);cursor:pointer;font-size:12px;padding:2px 7px;transition:all .15s}
+.del-btn:hover{border-color:var(--crit);color:var(--crit);background:rgba(242,96,79,.12)}
 .gpu-big{display:flex;align-items:center;gap:16px}
 .gpu-ring{--p:0;width:96px;height:96px;border-radius:50%;flex-shrink:0;background:conic-gradient(var(--accent) calc(var(--p)*1%),#0a0e14 0);display:flex;align-items:center;justify-content:center;position:relative}
 .gpu-ring::before{content:"";position:absolute;inset:9px;border-radius:50%;background:var(--panel)}
@@ -1314,7 +1339,7 @@ function renderSystem(d){
   const g=d.gpu||{},mem=d.mem||{},sw=d.swap||{};
   const disks=(d.disks||[]).map(dk=>{const cl=dk.pct>=90?"crit":dk.pct>=70?"hot":"";
     return `<div class="disk-row"><div class="dl"><span>${dk.label||dk.mount}</span><span>${fmtBytes(dk.free)} free · ${dk.pct}%</span></div><div class="bigmeter" style="height:10px"><span class="${cl}" style="width:${dk.pct}%"></span></div></div>`;}).join("")||'<div class="d-sub">–</div>';
-  const files=(d.largest||[]).map(f=>`<div class="file-row"><span class="fn" title="${f.path}">${f.name}</span><span class="fp">${f.path.replace(/\/[^/]*$/,"")}</span><span class="fs">${fmtBytes(f.size)}</span></div>`).join("")||'<div class="d-sub">none over 2 GB</div>';
+  const files=(d.largest||[]).map(f=>`<div class="file-row" data-path="${encodeURIComponent(f.path)}"><span class="fn" title="${f.path}">${f.name}</span><span class="fp">${f.path.replace(/\/[^/]*$/,"")}</span><span class="fs">${fmtBytes(f.size)}</span><button class="del-btn" title="Delete file" onclick='deleteFile(${JSON.stringify(f.path)},${f.size})'>🗑</button></div>`).join("")||'<div class="d-sub">none over 2 GB</div>';
   document.getElementById("sys-grid").innerHTML=`
     <div class="sys-card span2"><h3>CPU <span class="big">${d.cpu.pct??"–"}%</span></h3>
       ${areaGraph(SYS.cpu,"var(--accent)",{h:80,lg:true,max:100,cap:"CPU %",cur:(d.cpu.pct??"–")+"%"})}
@@ -1356,9 +1381,35 @@ function renderSystem(d){
     <div class="sys-card span2"><h3>Largest files <span class="big" style="font-size:11px;color:var(--ink3)">Spotlight · &gt; 2 GB</span></h3>${files}</div>`;
 }
 
-tick();media();
+async function deleteFile(path,size){
+  if(!confirm(`Permanently delete this file?\n\n${path}\n${fmtBytes(size)}\n\nThis cannot be undone.`))return;
+  try{
+    const r=await fetch("/api/delete-file",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})});
+    const d=await r.json();
+    if(d.ok){const row=document.querySelector(`.file-row[data-path="${encodeURIComponent(path)}"]`);if(row)row.remove();}
+    else alert("Delete failed: "+(d.error||"unknown"));
+  }catch(e){alert("Delete failed: "+e.message);}
+}
+async function activity(){
+  try{
+    const items=await(await fetch("/api/activity")).json();
+    const el=document.getElementById("activity");
+    if(!items||!items.length){el.innerHTML="";return;}
+    el.innerHTML=items.map(a=>{
+      const pct=Number.isFinite(a.progress)?a.progress:null;
+      const bar=pct!=null?`<span style="width:${pct}%"></span>`:`<span class="indet"></span>`;
+      const step=a.max_steps?` · ${a.step}/${a.max_steps}`:"";
+      const pr=a.prompt?" · "+a.prompt.slice(0,64):"";
+      return `<div class="act"><div class="ai" style="background:${a.color}22;color:${a.color}">${a.icon}</div>
+        <div style="min-width:0"><div class="an">${a.name} — working</div><div class="ap">${(a.phase||"")}${step}${pr}</div></div>
+        <div class="abar">${bar}</div><div class="apct">${pct!=null?pct.toFixed(0)+"%":"…"}</div></div>`;
+    }).join("");
+  }catch(e){}
+}
+tick();media();activity();
 setInterval(tick,5000);
 setInterval(media,15000);
+setInterval(activity,2000);
 </script>
 </body>
 </html>
@@ -1391,6 +1442,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(services_payload())
         elif self.path == "/api/system":
             self._json(system_payload())
+        elif self.path == "/api/activity":
+            self._json(activity_payload())
         elif self.path.startswith("/api/detail"):
             from urllib.parse import urlparse, parse_qs
             sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
@@ -1426,6 +1479,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/events/clear":
             self._json({"ok": clear_events()})
+            return
+        if self.path == "/api/delete-file":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+            except Exception:
+                self._json({"error": "bad request"}, 400)
+                return
+            raw = body.get("path", "")
+            p = Path(raw)
+            # Safety: must be an existing regular file (not a symlink or dir),
+            # under the user's home or an external /Volumes mount.
+            try:
+                is_link = p.is_symlink()
+                rp = p.resolve()
+                allowed = (str(rp).startswith(str(Path.home()) + "/")
+                           or str(rp).startswith("/Volumes/"))
+                if is_link or not rp.is_file() or not allowed:
+                    self._json({"error": "not allowed"}, 400)
+                    return
+                rp.unlink()
+                _LF_CACHE["ts"] = 0.0  # force largest-files rescan
+                log_event("system", "file_deleted", str(rp))
+                self._json({"ok": True})
+            except Exception as exc:
+                self._json({"error": str(exc)}, 500)
             return
         if self.path.startswith("/api/restart"):
             from urllib.parse import urlparse, parse_qs

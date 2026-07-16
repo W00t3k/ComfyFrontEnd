@@ -1980,6 +1980,22 @@ class Handler(BaseHTTPRequestHandler):
                 job = jobs.get(job_id, {})
             self.send_json(dict(job))
 
+        elif path == "/api/activity":
+            with jobs_lock:
+                act = None
+                for j in jobs.values():
+                    if j.get("status") in ("pending", "queued", "running"):
+                        done, total = j.get("done", 0), max(1, j.get("total", 1))
+                        act = {
+                            "active": True,
+                            "phase": j.get("phase") or j.get("status"),
+                            "progress": j.get("progress"),
+                            "step": j.get("step"), "max_steps": j.get("max_steps"),
+                            "done": done, "total": total,
+                            "prompt": j.get("prompt", ""),
+                        }
+            self.send_json(act or {"active": False})
+
         elif path.startswith("/img/"):
             name = urllib.parse.unquote(path[5:])
             target = (OUTPUT_DIR / name).resolve()
@@ -2019,6 +2035,7 @@ class Handler(BaseHTTPRequestHandler):
                     "done": 0,
                     "seeds": [],
                     "error": None,
+                    "prompt": (requests_list[0].get("prompt", "") if requests_list else ""),
                 }
 
             t = threading.Thread(target=run_job, args=(job_id, requests_list), daemon=True)

@@ -28,7 +28,7 @@ VIDEO_HISTORY_FILE = COMFY_DIR / "video_history.jsonl"
 PORT = 8192
 
 MODEL_FILE = "wan2.2_ti2v_5B_fp16.safetensors"
-TEXT_ENCODER = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+TEXT_ENCODER = "umt5_xxl_fp16.safetensors"  # fp8 emits garbage embeddings on Apple MPS
 VAE_FILE = "wan2.2_vae.safetensors"
 
 NEGATIVE = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
@@ -66,6 +66,38 @@ RANDOM_MOTION_PROMPTS = [
 jobs = {}
 jobs_lock = threading.Lock()
 
+# Local LLM used to refine a user's rough prompt into a strong video prompt.
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+REFINE_MODEL = os.environ.get("REFINE_MODEL", "llama3.1:8b")
+
+REFINE_SYSTEM = (
+    "You rewrite a user's rough idea into ONE vivid text-to-video prompt for a "
+    "diffusion model. Describe the SCENE and the MOTION (what moves, how) plus "
+    "camera movement and lighting. Keep it one sentence, under 60 words, concrete "
+    "and cinematic. No preamble, no quotes, no lists — output only the prompt."
+)
+
+
+def refine_prompt(text):
+    """Ask the local LLM to turn a rough idea into a strong motion prompt."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    payload = json.dumps({
+        "model": REFINE_MODEL,
+        "prompt": f"Rough idea: {text}\n\nRewrite it as a single cinematic video prompt.",
+        "system": REFINE_SYSTEM,
+        "stream": False,
+        "options": {"temperature": 0.8},
+    }).encode()
+    req = urllib.request.Request(OLLAMA_URL + "/api/generate", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        out = json.loads(r.read()).get("response", "").strip()
+    # Strip stray surrounding quotes/newlines the model sometimes adds.
+    out = " ".join(out.split()).strip('"').strip()
+    return out or None
+
 
 def models_available():
     return all([
@@ -95,7 +127,7 @@ def build_workflow(prompt, width, height, length, steps, seed, start_image=None)
     wf["8"] = {"class_type": "KSampler", "inputs": {
         "model": ["6", 0], "positive": ["4", 0], "negative": ["5", 0],
         "latent_image": ["7", 0], "seed": seed, "steps": steps, "cfg": 5.0,
-        "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1.0}}
+        "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}}
     wf["9"] = {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}
     wf["11"] = {"class_type": "CreateVideo", "inputs": {"images": ["9", 0], "fps": 24.0}}
     wf["12"] = {"class_type": "SaveVideo", "inputs": {
@@ -149,6 +181,10 @@ def progress_socket(job_id, client_id, ready):
 
 def run_job(job_id, req):
     seed = req.get("seed") or random.randint(0, 2**32 - 1)
+    with jobs_lock:
+        jobs[job_id].update(prompt=req.get("prompt", ""), created=time.time(),
+                            width=req["width"], height=req["height"],
+                            length=req["length"], steps=req["steps"])
     wf = build_workflow(req["prompt"], req["width"], req["height"],
                         req["length"], req["steps"], seed, req.get("start_image"))
 
@@ -172,6 +208,10 @@ def run_job(job_id, req):
 
     for _ in range(2700):
         time.sleep(4)
+        with jobs_lock:
+            if jobs.get(job_id, {}).get("cancel_requested"):
+                jobs[job_id].update(status="cancelled", phase="Cancelled")
+                return
         try:
             with urllib.request.urlopen(COMFY_URL + "/history/" + pid, timeout=30) as r:
                 history = json.loads(r.read())
@@ -311,6 +351,22 @@ textarea#prompt::placeholder{color:var(--text3)}
 .vid-actions{display:flex;gap:8px;flex-shrink:0;margin-left:8px}
 .vid-actions a,.vid-actions button{font-size:11px;color:var(--accent);background:none;border:none;cursor:pointer;text-decoration:none}
 .empty-state{grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text3);font-size:13px}
+.jobs-wrap{padding:0 24px 12px}
+#jobs-list{display:flex;flex-direction:column;gap:8px}
+.job-row{display:flex;gap:11px;align-items:center;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:11px 13px;transition:border-color .2s,background .2s}
+.job-row:hover{border-color:var(--border2,#333)}
+.job-active{border-color:rgba(45,108,223,.45);background:linear-gradient(90deg,rgba(45,108,223,.08),var(--surface2) 60%)}
+.job-badge{flex-shrink:0;display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;color:#fff;padding:3px 9px;border-radius:20px;text-transform:uppercase;letter-spacing:.4px}
+.job-spin{width:8px;height:8px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:jspin .7s linear infinite}
+@keyframes jspin{to{transform:rotate(360deg)}}
+.job-body{flex:1;min-width:0}
+.job-prompt{font-size:12.5px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.job-meta{font-size:10.5px;color:var(--text2);margin-top:3px;font-variant-numeric:tabular-nums}
+.job-track{height:5px;background:var(--border);border-radius:3px;margin-top:7px;overflow:hidden}
+.job-fill{height:100%;background:linear-gradient(90deg,var(--accent,#f76f8e),#ffa07a);border-radius:3px;transition:width .3s}
+.job-stop{flex-shrink:0;background:transparent;color:#e57373;border:1px solid rgba(229,115,115,.5);border-radius:8px;padding:5px 13px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s}
+.job-stop:hover{background:#b23b3b;color:#fff;border-color:#b23b3b}
+.job-stop:disabled{opacity:.5;cursor:wait}
 .warn-banner{background:rgba(251,191,36,.1);border:1px solid #fbbf24;color:#fbbf24;padding:10px 24px;font-size:13px;display:none}
 .warn-banner.visible{display:block}
 #toast-container{position:fixed;bottom:20px;right:20px;z-index:300;display:flex;flex-direction:column;gap:8px}
@@ -380,6 +436,7 @@ textarea#prompt::placeholder{color:var(--text3)}
   <main class="main">
     <div class="prompt-area">
       <div class="prompt-toolbar">
+        <button class="toolbar-btn" onclick="refinePrompt()" id="refine-btn">✨ Refine</button>
         <button class="toolbar-btn" onclick="randomPrompt()">🎲 Random</button>
         <span class="hint">Tip: describe the motion, not just the scene — "waves crashing", "camera pushes in", "hair blowing in wind"</span>
       </div>
@@ -393,6 +450,11 @@ textarea#prompt::placeholder{color:var(--text3)}
     <div class="progress-wrap" id="prog-wrap">
       <div class="progress-track"><div class="progress-fill" id="prog-fill"></div></div>
       <div class="progress-text"><span class="spinner"></span><span id="prog-text">Queuing…</span></div>
+    </div>
+
+    <div class="jobs-wrap" id="jobs-wrap" style="display:none">
+      <div class="gallery-header"><h2>Jobs</h2><span class="hint" id="jobs-count"></span></div>
+      <div id="jobs-list"></div>
     </div>
 
     <div class="gallery-wrap">
@@ -422,8 +484,10 @@ document.addEventListener('DOMContentLoaded', () => {
   slider.addEventListener('input', () => document.getElementById('steps-val').textContent = slider.value);
   checkServer();
   refreshGallery();
+  refreshJobs();
   setInterval(checkServer, 10000);
   setInterval(refreshGallery, 8000);
+  setInterval(refreshJobs, 3000);
   const dz = document.getElementById('drop-zone');
   dz.addEventListener('dragover', e => e.preventDefault());
   dz.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) uploadImage(e.dataTransfer.files[0]); });
@@ -506,6 +570,28 @@ async function randomPrompt() {
   document.getElementById('prompt').value = d.prompt;
 }
 
+async function refinePrompt() {
+  const box = document.getElementById('prompt');
+  const raw = box.value.trim();
+  if (!raw) { box.focus(); showToast('Type or speak an idea first', 'error'); return; }
+  const btn = document.getElementById('refine-btn');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = '✨ Refining…';
+  try {
+    const r = await fetch('/api/refine', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: raw }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'refine failed');
+    box.value = d.prompt;
+  } catch (e) {
+    showToast('Refine failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
 async function generate() {
   const prompt = document.getElementById('prompt').value.trim();
   if (!prompt) { document.getElementById('prompt').focus(); return; }
@@ -572,6 +658,55 @@ function pollJob(jobId) {
       }
     } catch {}
   }, 3000);
+}
+
+const JOB_BADGE = { queued:['#8a6d3b','Queued'], running:['#2d6cdf','Running'],
+  done:['#2e7d46','Done'], error:['#b23b3b','Error'], cancelled:['#6b7280','Stopped'],
+  unknown:['#555','—'] };
+
+function fmtDur(s){ if(s==null) return ''; s=Math.round(s); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
+
+async function cancelJob(id, btn){
+  if(btn){ btn.disabled=true; btn.textContent='Stopping…'; }
+  try{
+    const r=await fetch('/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:id})});
+    const d=await r.json();
+    if(!r.ok||d.error) throw new Error(d.error||'cancel failed');
+    showToast('Job stopped','success');
+    refreshJobs();
+  }catch(e){ showToast('Stop failed: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Stop';} }
+}
+
+async function refreshJobs() {
+  try {
+    const r = await fetch('/api/jobs');
+    const { jobs } = await r.json();
+    const wrap = document.getElementById('jobs-wrap');
+    const list = document.getElementById('jobs-list');
+    if (!jobs || !jobs.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    const active = jobs.filter(j => j.status==='running'||j.status==='queued').length;
+    document.getElementById('jobs-count').textContent =
+      active ? active + ' active · ' + jobs.length + ' total' : jobs.length + ' total';
+    list.innerHTML = jobs.map(j => {
+      const [col,lbl] = JOB_BADGE[j.status] || JOB_BADGE.unknown;
+      const isActive = j.status==='running' || j.status==='queued';
+      const pct = (j.status==='running' && j.progress!=null) ? j.progress : null;
+      const meta = [j.width&&j.height?`${j.width}×${j.height}`:null, j.steps?`${j.steps} steps`:null,
+                    fmtDur(j.elapsed)].filter(Boolean).join(' · ');
+      const phase = j.status==='running' ? (j.phase||'') : (j.error||'');
+      const spin = j.status==='running' ? '<span class="job-spin"></span>' : '';
+      const stop = isActive ? `<button class="job-stop" onclick="cancelJob('${j.job_id}',this)">Stop</button>` : '';
+      return `<div class="job-row ${isActive?'job-active':''}">
+        <span class="job-badge" style="background:${col}">${spin}${lbl}</span>
+        <div class="job-body">
+          <div class="job-prompt" title="${(j.prompt||'').replace(/"/g,'&quot;')}">${j.prompt||'(no prompt)'}</div>
+          <div class="job-meta">${meta}${phase?' · '+phase:''}</div>
+          ${pct!=null?`<div class="job-track"><div class="job-fill" style="width:${pct}%"></div></div>`:''}
+        </div>
+        ${stop}</div>`;
+    }).join('');
+  } catch (e) { /* studio busy */ }
 }
 
 async function refreshGallery() {
@@ -716,11 +851,40 @@ class Handler(BaseHTTPRequestHandler):
             self._json(list_videos())
         elif self.path == "/api/random_prompt":
             self._json({"prompt": random.choice(RANDOM_MOTION_PROMPTS)})
+        elif self.path == "/api/jobs":
+            now = time.time()
+            with jobs_lock:
+                items = []
+                for jid, j in jobs.items():
+                    started = j.get("started") or j.get("created")
+                    elapsed = j.get("elapsed")
+                    if elapsed is None and started and j.get("status") in ("running", "queued"):
+                        elapsed = int(now - started)
+                    items.append({
+                        "job_id": jid, "status": j.get("status", "unknown"),
+                        "phase": j.get("phase"), "progress": j.get("progress"),
+                        "prompt": (j.get("prompt") or "")[:120],
+                        "elapsed": elapsed, "created": j.get("created", 0),
+                        "error": j.get("error"), "filename": j.get("filename"),
+                        "width": j.get("width"), "height": j.get("height"),
+                        "steps": j.get("steps"),
+                    })
+            items.sort(key=lambda x: x.get("created", 0), reverse=True)
+            self._json({"jobs": items})
         elif self.path.startswith("/api/job/"):
             job_id = self.path.rsplit("/", 1)[-1]
             with jobs_lock:
                 job = dict(jobs.get(job_id, {"status": "unknown"}))
             self._json(job)
+        elif self.path == "/api/activity":
+            with jobs_lock:
+                act = None
+                for j in jobs.values():
+                    if j.get("status") in ("queued", "running"):
+                        act = {"active": True, "phase": j.get("phase") or j.get("status"),
+                               "progress": j.get("progress"), "step": j.get("step"),
+                               "max_steps": j.get("max_steps"), "prompt": j.get("prompt", "")}
+            self._json(act or {"active": False})
         elif self.path.startswith("/videos/"):
             rel = urllib.request.url2pathname(self.path[len("/videos/"):])
             p = self._safe_output_path(rel)
@@ -745,9 +909,56 @@ class Handler(BaseHTTPRequestHandler):
                 return
             job_id = str(uuid.uuid4())[:8]
             with jobs_lock:
-                jobs[job_id] = {"status": "queued"}
+                jobs[job_id] = {"status": "queued", "prompt": req.get("prompt", "")}
             threading.Thread(target=run_job, args=(job_id, req), daemon=True).start()
             self._json({"job_id": job_id})
+        elif self.path == "/api/refine":
+            try:
+                req = json.loads(self.rfile.read(length))
+            except Exception:
+                self._json({"error": "bad json"}, 400)
+                return
+            try:
+                refined = refine_prompt(req.get("prompt", ""))
+                if not refined:
+                    self._json({"error": "empty prompt"}, 400)
+                    return
+                self._json({"prompt": refined})
+            except Exception as e:
+                self._json({"error": f"LLM unavailable: {e}"}, 502)
+        elif self.path == "/api/cancel":
+            try:
+                req = json.loads(self.rfile.read(length))
+            except Exception:
+                self._json({"error": "bad json"}, 400)
+                return
+            job_id = req.get("job_id", "")
+            with jobs_lock:
+                job = jobs.get(job_id)
+                if not job:
+                    self._json({"error": "no such job"}, 404)
+                    return
+                if job.get("status") not in ("running", "queued"):
+                    self._json({"error": "job not active"}, 400)
+                    return
+                job["cancel_requested"] = True
+                pid = job.get("prompt_id")
+            # Drop from ComfyUI's pending queue, then interrupt if it's the live one.
+            try:
+                if pid:
+                    body = json.dumps({"delete": [pid]}).encode()
+                    urllib.request.urlopen(urllib.request.Request(
+                        COMFY_URL + "/queue", data=body,
+                        headers={"Content-Type": "application/json"}), timeout=10).read()
+                urllib.request.urlopen(urllib.request.Request(
+                    COMFY_URL + "/interrupt", data=b"",
+                    headers={"Content-Type": "application/json"}), timeout=10).read()
+            except Exception:
+                pass
+            with jobs_lock:
+                if jobs.get(job_id, {}).get("status") in ("running", "queued"):
+                    jobs[job_id].update(status="cancelled", phase="Cancelled")
+            self._json({"ok": True})
         elif self.path == "/api/upload":
             # Forward multipart body straight to ComfyUI's upload endpoint
             body = self.rfile.read(length)
