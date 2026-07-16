@@ -127,7 +127,7 @@ def build_workflow(prompt, width, height, length, steps, seed, start_image=None)
     wf["8"] = {"class_type": "KSampler", "inputs": {
         "model": ["6", 0], "positive": ["4", 0], "negative": ["5", 0],
         "latent_image": ["7", 0], "seed": seed, "steps": steps, "cfg": 5.0,
-        "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}}
+        "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1.0}}
     wf["9"] = {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}
     wf["11"] = {"class_type": "CreateVideo", "inputs": {"images": ["9", 0], "fps": 24.0}}
     wf["12"] = {"class_type": "SaveVideo", "inputs": {
@@ -314,6 +314,8 @@ header .spacer{flex:1}
 .custom-len input{width:74px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:5px 8px;font-size:12px}
 .custom-len input:focus{outline:none;border-color:var(--accent)}
 #len-info{color:var(--accent);margin-left:auto;font-variant-numeric:tabular-nums}
+.auto-refine{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text2);cursor:pointer;user-select:none}
+.auto-refine input{accent-color:var(--accent);cursor:pointer}
 .quality-row{display:flex;align-items:center;gap:10px}
 .quality-label{font-size:11px;color:var(--text3);white-space:nowrap}
 input[type=range]{-webkit-appearance:none;flex:1;height:3px;background:var(--border2);border-radius:3px;outline:none}
@@ -425,7 +427,7 @@ textarea#prompt::placeholder{color:var(--text3)}
       <div class="section-label">Length · 24 fps</div>
       <div class="pill-row" id="len-list"></div>
       <div class="custom-len">
-        <input type="number" id="len-secs" min="0.5" max="30" step="0.5" placeholder="custom">
+        <input type="number" id="len-secs" min="0.5" step="0.5" placeholder="any">
         <span>seconds</span>
         <span id="len-info"></span>
       </div>
@@ -447,7 +449,8 @@ textarea#prompt::placeholder{color:var(--text3)}
       <div class="prompt-toolbar">
         <button class="toolbar-btn" onclick="refinePrompt()" id="refine-btn">✨ Refine</button>
         <button class="toolbar-btn" onclick="randomPrompt()">🎲 Random</button>
-        <span class="hint">Tip: describe the motion, not just the scene — "waves crashing", "camera pushes in", "hair blowing in wind"</span>
+        <label class="auto-refine"><input type="checkbox" id="auto-refine" checked> Auto-refine on generate</label>
+        <span class="hint">Tip: describe the motion, not just the scene — "waves crashing", "camera pushes in"</span>
       </div>
       <textarea id="prompt" placeholder="Describe your video — scene AND motion…"></textarea>
       <div class="action-row">
@@ -543,7 +546,8 @@ function buildLenList() {
     if (f < 5) f = 5;
     vidLength = f;
     document.querySelectorAll('#len-list .pill').forEach(p => p.classList.remove('selected'));
-    document.getElementById('len-info').textContent = `${f} frames · ${(f / 24).toFixed(1)}s`;
+    const warn = secs > 15 ? ' ⚠ long — slow / may run out of memory' : '';
+    document.getElementById('len-info').textContent = `${f} frames · ${(f / 24).toFixed(1)}s${warn}`;
   });
 }
 
@@ -616,9 +620,23 @@ async function refinePrompt() {
 }
 
 async function generate() {
-  const prompt = document.getElementById('prompt').value.trim();
+  let prompt = document.getElementById('prompt').value.trim();
   if (!prompt) { document.getElementById('prompt').focus(); return; }
   if (mode === 'i2v' && !startImage) { showToast('Upload a start image first', 'error'); return; }
+
+  // Auto-refine: expand a rough prompt into a strong motion prompt first.
+  if (document.getElementById('auto-refine').checked) {
+    setGenerating(true);
+    document.getElementById('prog-text').textContent = 'Refining prompt…';
+    try {
+      const rr = await fetch('/api/refine', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+      const rd = await rr.json();
+      if (rr.ok && rd.prompt) { prompt = rd.prompt; document.getElementById('prompt').value = prompt; }
+    } catch (e) { /* fall back to raw prompt */ }
+  }
 
   const body = {
     prompt,
