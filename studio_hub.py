@@ -10,6 +10,7 @@ and every viewer sees the same status.
 
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -452,6 +453,164 @@ def services_payload():
     return {"services": svcs, "box": box, "events": recent_events()}
 
 
+def clear_events():
+    try:
+        EVENTS_FILE.write_text("")
+        return True
+    except Exception:
+        return False
+
+
+# ---- System Overview (modal) data ----
+_GPU_STATIC = None
+_LF_CACHE = {"ts": 0.0, "files": []}
+_SYS_PREV = {}  # net/disk io counters for rate calc
+
+
+def gpu_stats():
+    global _GPU_STATIC
+    util = mem_inuse = tiler = renderer = None
+    try:
+        out = subprocess.check_output(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                                      stderr=subprocess.DEVNULL, timeout=3).decode(errors="ignore")
+        m = re.search(r'"Device Utilization %"=(\d+)', out)
+        util = int(m.group(1)) if m else None
+        m = re.search(r'"Tiler Utilization %"=(\d+)', out)
+        tiler = int(m.group(1)) if m else None
+        m = re.search(r'"Renderer Utilization %"=(\d+)', out)
+        renderer = int(m.group(1)) if m else None
+        m = re.search(r'"In use system memory"=(\d+)', out)
+        mem_inuse = int(m.group(1)) if m else None
+    except Exception:
+        pass
+    if _GPU_STATIC is None:
+        chip = cores = None
+        try:
+            sp = subprocess.check_output(["system_profiler", "SPDisplaysDataType"],
+                                         stderr=subprocess.DEVNULL, timeout=8).decode(errors="ignore")
+            cm = re.search(r"Chipset Model: (.+)", sp)
+            chip = cm.group(1).strip() if cm else None
+            cc = re.search(r"Total Number of Cores: (\d+)", sp)
+            cores = int(cc.group(1)) if cc else None
+        except Exception:
+            pass
+        _GPU_STATIC = {"chip": chip, "cores": cores}
+    return {"util": util, "tiler": tiler, "renderer": renderer,
+            "mem_inuse": mem_inuse, **_GPU_STATIC}
+
+
+def largest_files(n=14, min_bytes=2_000_000_000):
+    if time.time() - _LF_CACHE["ts"] < 300 and _LF_CACHE["files"]:
+        return _LF_CACHE["files"]
+    files = []
+    try:
+        out = subprocess.check_output(["mdfind", "kMDItemFSSize > %d" % min_bytes],
+                                      stderr=subprocess.DEVNULL, timeout=8).decode(errors="ignore").splitlines()
+        for path in out[:500]:
+            try:
+                sz = os.stat(path).st_size
+                files.append({"path": path, "name": os.path.basename(path), "size": sz})
+            except Exception:
+                pass
+        files.sort(key=lambda f: f["size"], reverse=True)
+        files = files[:n]
+        _LF_CACHE.update(ts=time.time(), files=files)
+    except Exception:
+        pass
+    return _LF_CACHE["files"]
+
+
+def disk_list():
+    """Real user-facing volumes only: the boot container (/) and any /Volumes/*.
+    Uses shutil so the boot volume reports true container usage, not the sealed
+    read-only system snapshot that psutil reports for '/'."""
+    out = []
+    if psutil is None:
+        return out
+    seen = set()
+    for p in psutil.disk_partitions(all=False):
+        mp = p.mountpoint
+        if mp != "/" and not mp.startswith("/Volumes/"):
+            continue
+        if mp in seen:
+            continue
+        try:
+            u = shutil.disk_usage(mp)
+        except Exception:
+            continue
+        if u.total < 1_000_000_000:
+            continue
+        seen.add(mp)
+        label = "Macintosh HD" if mp == "/" else os.path.basename(mp)
+        out.append({"mount": mp, "label": label, "device": p.device,
+                    "total": u.total, "used": u.used, "free": u.free,
+                    "pct": round(u.used / u.total * 100, 1)})
+    return out
+
+
+def system_payload():
+    cores, top_cpu, top_mem = sample_cpu_and_procs(n=10)
+    now = time.time()
+    vm = sw = None
+    freq = None
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()
+        except Exception:
+            pass
+        try:
+            sw = psutil.swap_memory()
+        except Exception:
+            pass
+        try:
+            f = psutil.cpu_freq()
+            freq = round(f.current) if f else None
+        except Exception:
+            pass
+    # net + disk io rates
+    net_rx = net_tx = dio_r = dio_w = None
+    if psutil is not None:
+        try:
+            nio = psutil.net_io_counters()
+            dio = psutil.disk_io_counters()
+            prev = _SYS_PREV.get("t")
+            if prev:
+                dt = max(0.1, now - prev)
+                net_rx = int((nio.bytes_recv - _SYS_PREV["nrx"]) / dt)
+                net_tx = int((nio.bytes_sent - _SYS_PREV["ntx"]) / dt)
+                if dio:
+                    dio_r = int((dio.read_bytes - _SYS_PREV["dr"]) / dt)
+                    dio_w = int((dio.write_bytes - _SYS_PREV["dw"]) / dt)
+            _SYS_PREV.update(t=now, nrx=nio.bytes_recv, ntx=nio.bytes_sent,
+                             dr=dio.read_bytes if dio else 0, dw=dio.write_bytes if dio else 0)
+        except Exception:
+            pass
+    uptime_s = None
+    try:
+        bt = subprocess.check_output(["sysctl", "-n", "kern.boottime"]).decode()
+        uptime_s = int(time.time() - int(bt.split("sec = ")[1].split(",")[0]))
+    except Exception:
+        pass
+    return {
+        "cpu": {"cores": cores, "pct": round(sum(cores) / len(cores), 1) if cores else None,
+                "load": [round(x, 2) for x in os.getloadavg()], "ncpu": os.cpu_count(),
+                "freq_mhz": freq},
+        "gpu": gpu_stats(),
+        "mem": {"total": vm.total if vm else None, "used": vm.used if vm else None,
+                "available": vm.available if vm else None,
+                "wired": getattr(vm, "wired", None) if vm else None,
+                "pct": vm.percent if vm else None},
+        "swap": {"used": sw.used if sw else None, "total": sw.total if sw else None,
+                 "pct": sw.percent if sw else None},
+        "disks": disk_list(),
+        "net": {"rx": net_rx, "tx": net_tx},
+        "diskio": {"read": dio_r, "write": dio_w},
+        "top_cpu": top_cpu, "top_mem": top_mem,
+        "largest": largest_files(),
+        "uptime_s": uptime_s,
+    }
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -625,6 +784,50 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .proc-tbl td.n{color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
 .proc-tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
 .proc-tbl .cpuhot{color:var(--warn)}.proc-tbl .cpucrit{color:var(--crit)}
+/* system button, event controls, activity */
+.sysbtn{font-family:var(--mono);font-size:12px;padding:7px 13px;border-radius:9px;border:1px solid var(--line2);background:var(--panel);color:var(--ink);cursor:pointer;transition:all .15s;margin-right:12px}
+.sysbtn:hover{border-color:var(--accent);color:var(--accent);box-shadow:0 0 16px rgba(55,230,212,.2)}
+.panel-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.panel-head h2{margin:0}
+.panel-ctl{margin-left:auto;display:flex;gap:6px}
+.panel-ctl select,.mini-btn{font-family:var(--mono);font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid var(--line2);background:var(--panel);color:var(--ink2);cursor:pointer}
+.panel-ctl select:hover,.mini-btn:hover{border-color:var(--accent);color:var(--accent)}
+#activity{display:flex;flex-direction:column;gap:8px;margin:2px 0 6px}
+.act{display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,var(--panel),var(--panel2));border:1px solid var(--accent-dim);border-radius:12px;padding:11px 15px}
+.act .ai{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
+.act .an{font-weight:700;font-size:13px}
+.act .ap{font-family:var(--mono);font-size:11px;color:var(--ink2)}
+.act .abar{flex:1;height:6px;border-radius:3px;background:#0a0e14;overflow:hidden;position:relative;min-width:80px}
+.act .abar>span{display:block;height:100%;background:linear-gradient(90deg,var(--accent-dim),var(--accent));transition:width .5s}
+.act .abar>span.indet{width:35%!important;animation:slide 1.3s infinite;background:repeating-linear-gradient(90deg,var(--accent-dim) 0 10px,var(--accent) 10px 20px)}
+@keyframes slide{0%{transform:translateX(-120%)}100%{transform:translateX(360%)}}
+.act .apct{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent);min-width:40px;text-align:right}
+/* system modal */
+#sysmodal{position:fixed;inset:0;z-index:60;background:rgba(3,5,8,.92);backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:opacity .2s;overflow-y:auto}
+#sysmodal.open{opacity:1;pointer-events:auto}
+.sys-wrap{max-width:1240px;margin:0 auto;padding:26px 24px 60px}
+.sys-head{display:flex;align-items:center;gap:12px;margin-bottom:20px;position:sticky;top:0;background:rgba(3,5,8,.6);backdrop-filter:blur(6px);padding:6px 0;z-index:2}
+.sys-head h2{font-size:20px;font-weight:800}
+.sys-head .chip{font-family:var(--mono);font-size:11px;color:var(--ink2);border:1px solid var(--line2);border-radius:20px;padding:3px 11px}
+.sys-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+@media(max-width:820px){.sys-grid{grid-template-columns:1fr}}
+.sys-card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:15px;padding:16px 18px}
+.sys-card.span2{grid-column:1/-1}
+.sys-card h3{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink3);margin-bottom:11px;display:flex;justify-content:space-between}
+.sys-card h3 .big{font-size:15px;font-weight:800;color:var(--ink);letter-spacing:0}
+.disk-row{margin:9px 0}
+.disk-row .dl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--ink2);margin-bottom:3px}
+.file-row{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:11.5px;padding:4px 0;border-bottom:1px solid var(--line)}
+.file-row:last-child{border-bottom:none}
+.file-row .fn{flex:1;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file-row .fp{color:var(--ink3);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
+.file-row .fs{color:var(--accent);font-variant-numeric:tabular-nums;flex-shrink:0}
+.gpu-big{display:flex;align-items:center;gap:16px}
+.gpu-ring{--p:0;width:96px;height:96px;border-radius:50%;flex-shrink:0;background:conic-gradient(var(--accent) calc(var(--p)*1%),#0a0e14 0);display:flex;align-items:center;justify-content:center;position:relative}
+.gpu-ring::before{content:"";position:absolute;inset:9px;border-radius:50%;background:var(--panel)}
+.gpu-ring b{position:relative;font-size:22px;font-weight:800;font-variant-numeric:tabular-nums}
+.sys-close{margin-left:auto;font-family:var(--mono);font-size:13px;padding:7px 14px;border-radius:9px;border:1px solid var(--line2);background:var(--panel);color:var(--ink);cursor:pointer}
+.sys-close:hover{border-color:var(--crit);color:var(--crit)}
 </style>
 </head>
 <body>
@@ -634,8 +837,11 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
     <div class="brand"><div class="glyph">◧</div><h1>Mac Mini<span> Board</span></h1></div>
     <span class="pill"><b id="pill-up">–</b> <span id="pill-tot">/ –</span> up</span>
     <div class="sp"></div>
+    <button class="sysbtn" onclick="openSystem()">◱ System</button>
     <div class="tick"><i></i><span id="tick">live · 5s</span></div>
   </div>
+
+  <div id="activity"></div>
 
   <div class="vitals" id="vitals"></div>
   <div class="vdetail" id="vdetail"><div class="vdetail-inner" id="vdetail-inner"></div></div>
@@ -652,7 +858,18 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 
   <div class="cols">
     <div class="panel">
-      <h2>Watchdog Events</h2>
+      <div class="panel-head">
+        <h2>Watchdog Events</h2>
+        <div class="panel-ctl">
+          <select id="ev-sort" onchange="renderEvents()">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="service">By service</option>
+            <option value="down">Problems first</option>
+          </select>
+          <button class="mini-btn" onclick="clearEvents()">Clear</button>
+        </div>
+      </div>
       <div id="events"><div class="empty">No state changes yet — all quiet.</div></div>
     </div>
     <div class="panel">
@@ -674,6 +891,17 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
   </div>
   <div class="d-body" id="d-body"></div>
 </aside>
+
+<div id="sysmodal">
+  <div class="sys-wrap">
+    <div class="sys-head">
+      <h2>System Overview</h2>
+      <span class="chip" id="sys-chip">–</span>
+      <button class="sys-close" onclick="closeSystem()">✕ Close</button>
+    </div>
+    <div class="sys-grid" id="sys-grid"></div>
+  </div>
+</div>
 
 <script>
 const CATS=["Media","Downloads","AI","Studios","Apps"];
@@ -900,7 +1128,7 @@ function move(dir){ center=Math.max(0,Math.min(SVCS.length-1,center+dir)); layou
 document.getElementById("fprev").onclick=()=>move(-1);
 document.getElementById("fnext").onclick=()=>move(1);
 addEventListener("keydown",e=>{if(e.key==="ArrowLeft")move(-1);if(e.key==="ArrowRight")move(1);
-  if(e.key==="Escape"){closeDetail();return;}
+  if(e.key==="Escape"){if(document.getElementById("sysmodal").classList.contains("open")){closeSystem();return;}closeDetail();return;}
   if(e.key==="Enter"&&SVCS[center])openDetail(SVCS[center]);});
 let wheelLock=0;
 document.getElementById("stage").addEventListener("wheel",e=>{e.preventDefault();
@@ -1008,14 +1236,26 @@ function renderVitalDetail(kind,b){
   }
   return "";
 }
-function renderEvents(events){
+let allEvents=[];
+function renderEvents(){
   const ev=document.getElementById("events");
-  if(!events||!events.length){ev.innerHTML='<div class="empty">No state changes yet — all quiet.</div>';return;}
-  ev.innerHTML=events.map(e=>{
+  let list=[...allEvents];  // server returns newest-first
+  const sort=(document.getElementById("ev-sort")||{}).value||"newest";
+  const bad=new Set(["down","gave_up","restart_error","restart"]);
+  if(sort==="oldest")list.reverse();
+  else if(sort==="service")list.sort((a,b)=>(a.service||"").localeCompare(b.service||"")||(b.ts||"").localeCompare(a.ts||""));
+  else if(sort==="down")list.sort((a,b)=>(bad.has(b.event)?1:0)-(bad.has(a.event)?1:0));
+  if(!list.length){ev.innerHTML='<div class="empty">No state changes yet — all quiet.</div>';return;}
+  ev.innerHTML=list.map(e=>{
     const t=(e.ts||"").replace("T"," ").replace("Z","").slice(5,16);
     const nm=(SVMAP[e.service]||{}).name||e.service;
     return `<div class="ev"><span class="et">${t}</span><span class="es">${nm}</span><span class="ek ${e.event}">${e.event.replace(/_/g," ")}</span><span class="ed">${e.detail||""}</span></div>`;
   }).join("");
+}
+async function clearEvents(){
+  if(!confirm("Clear all watchdog events?"))return;
+  try{await fetch("/api/events/clear",{method:"POST"});}catch(e){}
+  allEvents=[];renderEvents();
 }
 async function tick(){
   try{
@@ -1040,7 +1280,7 @@ async function tick(){
         stat.innerHTML=`<span class="dot ${s.status}"></span>${s.status}`;
       });
     }
-    renderEvents(d.events);
+    allEvents=d.events||[];renderEvents();
   }catch(e){}
 }
 async function media(){
@@ -1057,6 +1297,65 @@ async function media(){
     }).join("");
   }catch(e){}
 }
+/* ---------- system overview modal ---------- */
+let sysTimer=null;
+const SYS={cpu:[],gpu:[],mem:[],rx:[],tx:[]};
+function pushCap(a,v){a.push(v==null?0:v);if(a.length>90)a.shift();}
+function openSystem(){document.getElementById("sysmodal").classList.add("open");sysTick();if(sysTimer)clearInterval(sysTimer);sysTimer=setInterval(sysTick,2500);}
+function closeSystem(){document.getElementById("sysmodal").classList.remove("open");if(sysTimer){clearInterval(sysTimer);sysTimer=null;}}
+async function sysTick(){
+  let d;try{d=await(await fetch("/api/system")).json();}catch(e){return;}
+  pushCap(SYS.cpu,d.cpu.pct);pushCap(SYS.gpu,d.gpu.util);pushCap(SYS.mem,d.mem.pct);pushCap(SYS.rx,d.net.rx);pushCap(SYS.tx,d.net.tx);
+  document.getElementById("sys-chip").textContent=`${d.gpu.chip||"Mac"} · ${d.cpu.ncpu} CPU · ${d.gpu.cores||"?"}-core GPU · up ${fmtDur(d.uptime_s)}`;
+  renderSystem(d);
+}
+function renderSystem(d){
+  const rxMax=Math.max(1,...SYS.rx,...SYS.tx);
+  const g=d.gpu||{},mem=d.mem||{},sw=d.swap||{};
+  const disks=(d.disks||[]).map(dk=>{const cl=dk.pct>=90?"crit":dk.pct>=70?"hot":"";
+    return `<div class="disk-row"><div class="dl"><span>${dk.label||dk.mount}</span><span>${fmtBytes(dk.free)} free · ${dk.pct}%</span></div><div class="bigmeter" style="height:10px"><span class="${cl}" style="width:${dk.pct}%"></span></div></div>`;}).join("")||'<div class="d-sub">–</div>';
+  const files=(d.largest||[]).map(f=>`<div class="file-row"><span class="fn" title="${f.path}">${f.name}</span><span class="fp">${f.path.replace(/\/[^/]*$/,"")}</span><span class="fs">${fmtBytes(f.size)}</span></div>`).join("")||'<div class="d-sub">none over 2 GB</div>';
+  document.getElementById("sys-grid").innerHTML=`
+    <div class="sys-card span2"><h3>CPU <span class="big">${d.cpu.pct??"–"}%</span></h3>
+      ${areaGraph(SYS.cpu,"var(--accent)",{h:80,lg:true,max:100,cap:"CPU %",cur:(d.cpu.pct??"–")+"%"})}
+      <div style="margin-top:12px">${coreMeters(d.cpu.cores)}</div>
+      <div class="d-sub" style="margin-top:8px">load ${(d.cpu.load||[]).join(" / ")}</div>
+    </div>
+    <div class="sys-card"><h3>GPU <span class="big">${g.util??"–"}%</span></h3>
+      <div class="gpu-big">
+        <div class="gpu-ring" style="--p:${g.util||0}"><b>${g.util??"–"}%</b></div>
+        <div class="kv" style="flex:1">
+          <span class="k">chip</span><span class="v">${g.chip||"–"}</span>
+          <span class="k">gpu cores</span><span class="v">${g.cores??"–"}</span>
+          <span class="k">gpu memory</span><span class="v">${fmtBytes(g.mem_inuse)}</span>
+          <span class="k">tiler</span><span class="v">${g.tiler??"–"}%</span>
+          <span class="k">renderer</span><span class="v">${g.renderer??"–"}%</span>
+        </div>
+      </div>
+      ${areaGraph(SYS.gpu,"#c084fc",{h:44,max:100,cap:"GPU %",cur:(g.util??"–")+"%"})}
+    </div>
+    <div class="sys-card"><h3>Memory <span class="big">${mem.pct??"–"}%</span></h3>
+      ${areaGraph(SYS.mem,"#38bdf8",{h:44,max:100,cap:"MEM %",cur:(mem.pct??"–")+"%"})}
+      <div class="kv" style="margin-top:10px">
+        <span class="k">used</span><span class="v">${fmtBytes(mem.used)} / ${fmtBytes(mem.total)}</span>
+        <span class="k">available</span><span class="v">${fmtBytes(mem.available)}</span>
+        <span class="k">wired</span><span class="v">${fmtBytes(mem.wired)}</span>
+        <span class="k">swap</span><span class="v">${fmtBytes(sw.used)} / ${fmtBytes(sw.total)} (${sw.pct??0}%)</span>
+      </div>
+    </div>
+    <div class="sys-card"><h3>Disks</h3>${disks}</div>
+    <div class="sys-card"><h3>Network &amp; Disk I/O</h3>
+      ${areaGraph(SYS.rx,"#3ad07f",{h:40,max:rxMax,cap:"net ↓",cur:fmtBytes(d.net.rx)+"/s"})}
+      <div style="height:6px"></div>
+      ${areaGraph(SYS.tx,"#f4b740",{h:40,max:rxMax,cap:"net ↑",cur:fmtBytes(d.net.tx)+"/s"})}
+      <div class="kv" style="margin-top:10px"><span class="k">disk read</span><span class="v">${fmtBytes(d.diskio.read)}/s</span>
+      <span class="k">disk write</span><span class="v">${fmtBytes(d.diskio.write)}/s</span></div>
+    </div>
+    <div class="sys-card"><h3>Top by CPU</h3>${procRows(d.top_cpu)}</div>
+    <div class="sys-card"><h3>Top by memory</h3>${procRowsMem(d.top_mem)}</div>
+    <div class="sys-card span2"><h3>Largest files <span class="big" style="font-size:11px;color:var(--ink3)">Spotlight · &gt; 2 GB</span></h3>${files}</div>`;
+}
+
 tick();media();
 setInterval(tick,5000);
 setInterval(media,15000);
@@ -1090,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif self.path == "/api/status":
             self._json(services_payload())
+        elif self.path == "/api/system":
+            self._json(system_payload())
         elif self.path.startswith("/api/detail"):
             from urllib.parse import urlparse, parse_qs
             sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
@@ -1123,6 +1424,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if self.path == "/api/events/clear":
+            self._json({"ok": clear_events()})
+            return
         if self.path.startswith("/api/restart"):
             from urllib.parse import urlparse, parse_qs
             sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
