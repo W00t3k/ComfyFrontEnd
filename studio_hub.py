@@ -503,6 +503,23 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .vdetail h3{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3);margin-bottom:10px}
 .vd-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:640px){.vd-grid{grid-template-columns:1fr}}
+/* btop-style graphics */
+.graph{width:100%;height:64px;display:block;border-radius:8px;background:#0a0e14;border:1px solid var(--line)}
+.graph-lg{height:96px}
+.graph-wrap{position:relative}
+.graph-cap{position:absolute;top:6px;left:9px;font-family:var(--mono);font-size:10px;color:var(--ink3);letter-spacing:.05em}
+.graph-cur{position:absolute;top:6px;right:9px;font-family:var(--mono);font-size:11px;font-weight:700;font-variant-numeric:tabular-nums}
+.cm{display:flex;align-items:center;gap:8px;margin:3px 0;font-family:var(--mono);font-size:10px}
+.cm-l{color:var(--ink3);width:24px;flex-shrink:0}
+.cm-t{flex:1;height:9px;border-radius:3px;background:#0a0e14;overflow:hidden;position:relative}
+.cm-t::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 4px,rgba(6,8,12,.85) 4px 5px);pointer-events:none}
+.cm-f{display:block;height:100%;background:linear-gradient(90deg,var(--ok),var(--warn) 68%,var(--crit));transition:width .5s}
+.cm-v{width:34px;text-align:right;color:var(--ink2);flex-shrink:0;font-variant-numeric:tabular-nums}
+.bigmeter{height:14px;border-radius:5px;background:#0a0e14;overflow:hidden;position:relative;margin-top:4px}
+.bigmeter::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 6px,rgba(6,8,12,.8) 6px 7px)}
+.bigmeter>span{display:block;height:100%;background:linear-gradient(90deg,var(--ok),var(--warn) 70%,var(--crit));transition:width .5s}
+.corewrap{display:grid;grid-template-columns:1fr 1fr;gap:2px 18px}
+@media(max-width:640px){.corewrap{grid-template-columns:1fr}}
 .vital .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
 .vital .v small{font-size:12px;color:var(--ink2);font-weight:400}
 .meter{height:4px;border-radius:3px;background:#0a0e14;margin-top:9px;overflow:hidden}
@@ -801,11 +818,31 @@ function sparkline(hist){
     <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
     <polyline points="0,${H} ${pts} ${W},${H}" fill="var(--accent)" fill-opacity=".08" stroke="none"/></svg>`;
 }
-function coreBars(cores){
-  if(!cores||!cores.length)return "";
-  return `<div class="cores">${cores.map((c,i)=>{const cl=c>=85?"crit":c>=55?"hot":"";
-    return `<div class="core">c${i} ${c.toFixed(0)}%<div class="cbar"><span class="${cl}" style="width:${Math.min(100,c)}%"></span></div></div>`;}).join("")}</div>`;
+/* ---- btop-style graph kit ---- */
+const HIST={cpu:[],mem:[],rx:[],tx:[]};
+function pushHist(k,v){const a=HIST[k];a.push(v==null?0:v);if(a.length>90)a.shift();}
+function areaGraph(data,color,opt){
+  opt=opt||{};const w=560,h=opt.h||64,max=opt.max||Math.max(1,...data);
+  if(!data||data.length<2)return `<div class="graph-wrap"><div class="graph ${opt.lg?'graph-lg':''}"></div><span class="graph-cap">${opt.cap||""}</span><span class="graph-cur" style="color:${color}">collecting…</span></div>`;
+  const n=data.length,X=i=>(i/(n-1)*w),Y=v=>h-1-(Math.min(v,max)/max)*(h-3);
+  const line=data.map((v,i)=>`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+  const uid="ag"+Math.random().toString(36).slice(2,7);
+  return `<div class="graph-wrap">
+    <svg class="graph ${opt.lg?'graph-lg':''}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <defs><linearGradient id="${uid}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="${color}" stop-opacity=".5"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+      <polygon points="0,${h} ${line} ${w},${h}" fill="url(#${uid})"/>
+      <polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    </svg>
+    <span class="graph-cap">${opt.cap||""}</span>
+    <span class="graph-cur" style="color:${color}">${opt.cur!=null?opt.cur:""}</span></div>`;
 }
+function coreMeters(cores){
+  if(!cores||!cores.length)return "";
+  return `<div class="corewrap">${cores.map((c,i)=>{const cl=c>=85?"crit":c>=55?"hot":"";
+    return `<div class="cm"><span class="cm-l">c${i}</span><div class="cm-t"><span class="cm-f ${cl}" style="width:${Math.min(100,c)}%"></span></div><span class="cm-v">${c.toFixed(0)}%</span></div>`;}).join("")}</div>`;
+}
+function bigMeter(pct){const cl=pct>=90?"crit":pct>=70?"hot":"";return `<div class="bigmeter"><span class="${cl}" style="width:${Math.min(100,pct||0)}%"></span></div>`;}
 function procRows(top,ncpu){
   if(!top||!top.length)return "";
   return `<table class="proc-tbl"><thead><tr><th>process</th><th style="text-align:right">cpu%</th><th style="text-align:right">mem</th></tr></thead><tbody>
@@ -914,15 +951,27 @@ function renderVitalDetail(kind,b){
       <table class="proc-tbl"><thead><tr><th>service</th><th style="text-align:right">status</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
   if(kind==="load"){
+    const rxMax=Math.max(1,...HIST.rx,...HIST.tx);
     return `<h3>CPU ${b.cpu_pct??"–"}% · load ${(b.load||[]).join(" / ")||"–"} · ${b.cpus||"?"} cores</h3>
-      <div class="vd-grid"><div>${coreBars(b.cpu_cores)}</div>
-      <div><h3>Top by CPU</h3>${procRows(b.top,b.cpus)}</div></div>`;
+      ${areaGraph(HIST.cpu,"var(--accent)",{h:96,lg:true,max:100,cap:"CPU %",cur:(b.cpu_pct??"–")+"%"})}
+      <div class="vd-grid" style="margin-top:14px">
+        <div>${coreMeters(b.cpu_cores)}</div>
+        <div>
+          <h3>Network</h3>
+          ${areaGraph(HIST.rx,"#3ad07f",{h:40,max:rxMax,cap:"↓ rx",cur:fmtBytes(b.net_rx)+"/s"})}
+          <div style="height:6px"></div>
+          ${areaGraph(HIST.tx,"#f4b740",{h:40,max:rxMax,cap:"↑ tx",cur:fmtBytes(b.net_tx)+"/s"})}
+        </div>
+      </div>
+      <h3 style="margin-top:14px">Top by CPU</h3>${procRows(b.top,b.cpus)}`;
   }
   if(kind==="memory"){
     const m=b.mem_detail||{};const g=k=>m[k]!=null?fmtBytes(m[k]):"–";
+    const memPct=(b.mem_total&&b.mem_free)?Math.round((b.mem_total-b.mem_free)/b.mem_total*100):0;
     const swapPct=b.swap_total?Math.round((b.swap_used||0)/b.swap_total*100):0;
-    return `<h3>Memory breakdown</h3>
-      <div class="vd-grid">
+    return `<h3>Memory ${memPct}% used</h3>
+      ${areaGraph(HIST.mem,"#c084fc",{h:80,lg:true,max:100,cap:"MEM %",cur:memPct+"%"})}
+      <div class="vd-grid" style="margin-top:14px">
         <div class="kv">
           <span class="k">total</span><span class="v">${g("total")}</span>
           <span class="k">used</span><span class="v">${g("used")}</span>
@@ -931,20 +980,23 @@ function renderVitalDetail(kind,b){
           <span class="k">active</span><span class="v">${g("active")}</span>
           <span class="k">inactive</span><span class="v">${g("inactive")}</span>
           <span class="k">free</span><span class="v">${g("free")}</span>
-          <span class="k">swap</span><span class="v">${fmtBytes(b.swap_used)} / ${fmtBytes(b.swap_total)} (${swapPct}%)</span>
+          <span class="k">swap</span><span class="v">${fmtBytes(b.swap_used)} / ${fmtBytes(b.swap_total)}</span>
         </div>
-        <div><h3>Top by memory</h3>${procRowsMem(b.top_mem)}</div>
+        <div>
+          <div class="cm"><span class="cm-l" style="width:34px">mem</span><div class="cm-t"><span class="cm-f ${memPct>=90?'crit':memPct>=70?'hot':''}" style="width:${memPct}%"></span></div><span class="cm-v">${memPct}%</span></div>
+          <div class="cm"><span class="cm-l" style="width:34px">swap</span><div class="cm-t"><span class="cm-f ${swapPct>=90?'crit':swapPct>=70?'hot':''}" style="width:${swapPct}%"></span></div><span class="cm-v">${swapPct}%</span></div>
+          <h3 style="margin-top:12px">Top by memory</h3>${procRowsMem(b.top_mem)}
+        </div>
       </div>`;
   }
   if(kind==="disk"){
     const used=(b.disk_total&&b.disk_free)?b.disk_total-b.disk_free:null;
     const pct=used?Math.round(used/b.disk_total*100):0;
-    const cl=pct>=90?"crit":pct>=70?"hot":"";
-    return `<h3>Disk · / volume</h3>
+    return `<h3>Disk · / volume · ${pct}% used</h3>
       <div class="kv"><span class="k">total</span><span class="v">${fmtBytes(b.disk_total)}</span>
-      <span class="k">used</span><span class="v">${fmtBytes(used)} (${pct}%)</span>
+      <span class="k">used</span><span class="v">${fmtBytes(used)}</span>
       <span class="k">free</span><span class="v">${fmtBytes(b.disk_free)}</span></div>
-      <div class="meter" style="height:8px;margin-top:12px"><span class="${cl}" style="width:${pct}%"></span></div>`;
+      ${bigMeter(pct)}`;
   }
   if(kind==="uptime"){
     const boot=b.uptime_s!=null?new Date(Date.now()-b.uptime_s*1000).toLocaleString():"–";
@@ -973,6 +1025,10 @@ async function tick(){
     document.getElementById("pill-up").textContent=up;
     document.getElementById("pill-tot").textContent="/ "+SVCS.length;
     window.__box=d.box||{};
+    const bb=d.box||{};
+    pushHist("cpu",bb.cpu_pct);
+    pushHist("mem",(bb.mem_total&&bb.mem_free)?Math.round((bb.mem_total-bb.mem_free)/bb.mem_total*100):0);
+    pushHist("rx",bb.net_rx);pushHist("tx",bb.net_tx);
     renderVitals(d.box||{},up,SVCS.length);
     if(detailSvc){const fresh=SVMAP[detailSvc.id];if(fresh)detailSvc=fresh;}
     if(document.querySelectorAll(".cf").length!==SVCS.length){center=Math.min(center,SVCS.length-1);buildFlow();}
