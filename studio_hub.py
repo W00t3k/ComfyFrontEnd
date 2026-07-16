@@ -392,6 +392,62 @@ def recent_media(limit=18):
     return items[:limit]
 
 
+# MajicMovie ("Magic" app) exposes the newest usenet movie releases. The hub
+# proxies it server-side so the browser avoids a cross-origin call to :8443.
+MAGIC_URL = os.environ.get("MAGIC_URL", "http://127.0.0.1:8443").rstrip("/")
+_movies_cache = {"ts": 0.0, "items": []}
+
+
+def _rel_time(raw):
+    """Turn a feed date into a short 'added Nh ago' style string."""
+    if not raw:
+        return ""
+    dt = None
+    for fmt in ("%a, %d %m %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %Z",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(raw.strip(), fmt)
+            break
+        except (ValueError, TypeError):
+            continue
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    if secs < 0:
+        return "just now"
+    if secs < 3600:
+        return "%dm ago" % max(1, int(secs // 60))
+    if secs < 86400:
+        return "%dh ago" % int(secs // 3600)
+    return "%dd ago" % int(secs // 86400)
+
+
+def recent_movies(limit=12):
+    now = time.time()
+    if now - _movies_cache["ts"] < 60 and _movies_cache["items"]:
+        return _movies_cache["items"][:limit]
+    items = []
+    try:
+        url = MAGIC_URL + "/api/usenet/latest?limit=%d" % limit
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.loads(r.read())
+        for m in data.get("releases", []):
+            items.append({
+                "title": m.get("title") or m.get("release_name") or "Untitled",
+                "year": m.get("year"),
+                "poster": m.get("poster_url") or "",
+                "ago": _rel_time(m.get("nzbgeek_found_at") or m.get("pub_date") or ""),
+                "link": m.get("link") or "",
+            })
+        _movies_cache.update(ts=now, items=items)
+    except Exception:
+        # On failure keep serving the last good cache rather than an empty strip.
+        return _movies_cache["items"][:limit]
+    return items[:limit]
+
+
 def pid_on_port(port):
     try:
         out = subprocess.check_output(
@@ -472,7 +528,8 @@ def activity_payload():
             out.append({"id": sid, "name": name, "color": color, "icon": icon,
                         "phase": a.get("phase"), "progress": a.get("progress"),
                         "step": a.get("step"), "max_steps": a.get("max_steps"),
-                        "prompt": a.get("prompt", "")})
+                        "prompt": a.get("prompt", ""),
+                        "seg": a.get("seg"), "nsegs": a.get("nsegs")})
     return out
 
 
@@ -770,6 +827,39 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
 .media a{display:block;border-radius:9px;overflow:hidden;border:1px solid var(--line);aspect-ratio:1;background:#000}
 .media img,.media video{width:100%;height:100%;object-fit:cover;display:block}
 .media .aud{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;background:linear-gradient(135deg,#0d2b21,#0a1a14)}
+.movies-src{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);font-variant-numeric:tabular-nums}
+.mtoggle{width:30px;height:30px;border-radius:9px;border:1px solid var(--line2);background:var(--panel);font-size:15px;line-height:1;cursor:pointer;transition:all .18s;display:flex;align-items:center;justify-content:center;filter:grayscale(.4)}
+.mtoggle:hover{border-color:var(--accent);transform:translateY(-1px)}
+.mtoggle.open{border-color:var(--accent);background:rgba(55,230,212,.1);filter:none;box-shadow:0 0 14px rgba(55,230,212,.25)}
+/* movie coverflow — collapsed until the film toggle is clicked */
+.mstage-wrap{overflow:hidden;max-height:0;opacity:0;transition:max-height .45s cubic-bezier(.22,1,.36,1),opacity .3s,margin .3s;margin:0}
+.mstage-wrap.open{max-height:560px;opacity:1;margin:22px 0 8px}
+.mstage-title{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.mstage-title h2{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink3)}
+.mstage-title h2 .movies-src{margin-left:8px;color:var(--accent-dim)}
+.mstage-title .hint{font-family:var(--mono);font-size:10px;color:var(--ink3);margin-left:auto}
+.mstage{position:relative;height:390px;perspective:1600px;overflow:hidden;user-select:none}
+.mflow{position:absolute;inset:0;transform-style:preserve-3d}
+.mcf{position:absolute;top:50%;left:50%;width:186px;height:279px;margin:-150px 0 0 -93px;
+  border-radius:13px;cursor:pointer;transition:transform .5s cubic-bezier(.22,1,.36,1),opacity .5s,box-shadow .3s;
+  transform-style:preserve-3d;border:1px solid var(--line2);overflow:visible;background:#0a0e14}
+.mcf-poster{position:relative;width:100%;height:100%;border-radius:13px;overflow:hidden;background:linear-gradient(160deg,var(--panel2),#0a0e14)}
+.mcf-poster img{width:100%;height:100%;object-fit:cover;display:block;position:relative;z-index:1}
+.mcf-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:34px;opacity:.35}
+.mcf-ago{position:absolute;top:8px;left:8px;z-index:3;font-family:var(--mono);font-size:9px;letter-spacing:.06em;color:rgba(255,255,255,.92);background:rgba(3,5,8,.7);border:1px solid rgba(255,255,255,.14);border-radius:20px;padding:2px 8px;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.mcf-grad{position:absolute;inset:0;z-index:2;background:linear-gradient(180deg,transparent 45%,rgba(3,5,8,.92) 100%)}
+.mcf-cap{position:absolute;left:12px;right:12px;bottom:11px;z-index:3}
+.mcf-nm{font-size:14px;font-weight:800;line-height:1.22;color:#fff;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;text-shadow:0 1px 4px rgba(0,0,0,.6)}
+.mcf-yr{font-family:var(--mono);font-size:10px;letter-spacing:.05em;color:rgba(255,255,255,.6);margin-top:2px;font-variant-numeric:tabular-nums}
+.mcf-rt{position:absolute;top:8px;right:8px;z-index:4;width:26px;height:26px;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(3,5,8,.55);color:#fff;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:all .15s;backdrop-filter:blur(4px);text-decoration:none}
+.mcf.center .mcf-rt{opacity:1}
+.mcf-rt:hover{border-color:#fa320a;color:#fa320a;background:rgba(3,5,8,.85)}
+.mcf .mreflect{position:absolute;left:0;right:0;top:100%;height:42%;border-radius:13px;overflow:hidden;
+  transform:scaleY(-1);opacity:.28;-webkit-mask-image:linear-gradient(180deg,rgba(0,0,0,.55),transparent 75%);
+  mask-image:linear-gradient(180deg,rgba(0,0,0,.55),transparent 75%);pointer-events:none}
+.mcf .mreflect img{width:100%;height:238%;object-fit:cover;object-position:top;display:block}
+.mcf.center{box-shadow:0 30px 70px rgba(0,0,0,.6),0 0 0 1px var(--accent-dim);border-color:var(--accent-dim)}
+.mstage .flow-nav{top:44%}
 @media(prefers-reduced-motion:reduce){.cf{transition:none}.tick i,.dot.restarting{animation:none}}
 
 /* ---- btop-style detail drawer ---- */
@@ -862,8 +952,20 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
     <div class="brand"><div class="glyph">◧</div><h1>Mac Mini<span> Board</span></h1></div>
     <span class="pill"><b id="pill-up">–</b> <span id="pill-tot">/ –</span> up</span>
     <div class="sp"></div>
+    <span class="movies-src" id="movies-count"></span>
+    <button class="mtoggle" id="movies-toggle" onclick="toggleMovies()" title="Latest usenet releases">🎬</button>
     <button class="sysbtn" onclick="openSystem()">◱ System</button>
     <div class="tick"><i></i><span id="tick">live · 5s</span></div>
+  </div>
+
+  <div class="mstage-wrap" id="mstage-wrap">
+    <div class="mstage-title"><h2>Fresh on Usenet <span class="movies-src">via Magic</span></h2><span class="hint">← → scroll · click for Rotten Tomatoes</span></div>
+    <div class="mstage" id="mstage">
+      <button class="flow-nav" id="mprev" aria-label="Previous">&#8249;</button>
+      <div class="mflow" id="mflow"></div>
+      <button class="flow-nav" id="mnext" aria-label="Next">&#8250;</button>
+    </div>
+    <div class="dots" id="mdots"></div>
   </div>
 
   <div id="activity"></div>
@@ -902,6 +1004,7 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14p
       <div class="media" id="mediaGrid"></div>
     </div>
   </div>
+
 </div>
 
 <div id="scrim" onclick="closeDetail()"></div>
@@ -1152,6 +1255,9 @@ async function restartFromDetail(){
 function move(dir){ center=Math.max(0,Math.min(SVCS.length-1,center+dir)); layout(); }
 document.getElementById("fprev").onclick=()=>move(-1);
 document.getElementById("fnext").onclick=()=>move(1);
+document.getElementById("mprev").onclick=()=>mmove(-1);
+document.getElementById("mnext").onclick=()=>mmove(1);
+{let mwl=0;document.getElementById("mstage").addEventListener("wheel",e=>{e.preventDefault();const n=Date.now();if(n-mwl<220)return;mwl=n;mmove(e.deltaY>0||e.deltaX>0?1:-1);},{passive:false});}
 addEventListener("keydown",e=>{if(e.key==="ArrowLeft")move(-1);if(e.key==="ArrowRight")move(1);
   if(e.key==="Escape"){if(document.getElementById("sysmodal").classList.contains("open")){closeSystem();return;}closeDetail();return;}
   if(e.key==="Enter"&&SVCS[center])openDetail(SVCS[center]);});
@@ -1322,6 +1428,57 @@ async function media(){
     }).join("");
   }catch(e){}
 }
+let MOVIES=[],mcenter=0,moviesOpen=false;
+function esc(s){return (s||"").replace(/"/g,"&quot;").replace(/</g,"&lt;");}
+function rtUrl(m){return "https://www.rottentomatoes.com/search?search="+encodeURIComponent(m.title+(m.year?" "+m.year:""));}
+
+async function movies(force){
+  try{
+    MOVIES=await(await fetch("/api/recent-movies"+(force?"?t="+Date.now():""))).json();
+    const cnt=document.getElementById("movies-count");
+    if(cnt)cnt.textContent=(MOVIES&&MOVIES.length?MOVIES.length+" new · ":"")+"via Magic";
+    if(moviesOpen)renderMFlow();
+  }catch(e){}
+}
+function toggleMovies(){
+  moviesOpen=!moviesOpen;
+  document.getElementById("mstage-wrap").classList.toggle("open",moviesOpen);
+  document.getElementById("movies-toggle").classList.toggle("open",moviesOpen);
+  if(moviesOpen){ if(mcenter>=MOVIES.length)mcenter=0; renderMFlow(); }
+}
+function renderMFlow(){
+  const flow=document.getElementById("mflow"),dots=document.getElementById("mdots");
+  if(!MOVIES||!MOVIES.length){flow.innerHTML='<div class="empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">No recent releases.</div>';dots.innerHTML="";return;}
+  flow.innerHTML=MOVIES.map((m,i)=>{
+    const img=m.poster?`<img src="${esc(m.poster)}" loading="lazy" onerror="this.style.display='none'">`:"";
+    const refl=m.poster?`<div class="mreflect"><img src="${esc(m.poster)}"></div>`:"";
+    const ago=m.ago?`<span class="mcf-ago">${esc(m.ago)}</span>`:"";
+    const yr=m.year?`<div class="mcf-yr">${m.year}</div>`:"";
+    return `<div class="mcf" data-i="${i}" onclick="openMovie(${i})">
+      <div class="mcf-poster">${img}<span class="mcf-fallback">🎬</span>${ago}<div class="mcf-grad"></div>
+        <div class="mcf-cap"><div class="mcf-nm">${esc(m.title)}</div>${yr}</div></div>
+      <a class="mcf-rt" href="${rtUrl(m)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Rotten Tomatoes">🍅</a>
+      ${refl}</div>`;
+  }).join("");
+  dots.innerHTML="";
+  MOVIES.forEach((m,i)=>{const d=document.createElement("i");if(i===mcenter)d.className="on";d.onclick=()=>{mcenter=i;mlayout();};dots.appendChild(d);});
+  mlayout();
+}
+function mlayout(){
+  document.querySelectorAll("#mflow .mcf").forEach((el,i)=>{
+    const off=i-mcenter,a=Math.abs(off);
+    const tx=off*128 - Math.sign(off)*18*Math.min(a,1);
+    const ry=off===0?0:(off<0?40:-40);
+    const tz=off===0?70:-Math.min(a,4)*90;
+    el.style.transform=`translateX(${tx}px) translateZ(${tz}px) rotateY(${ry}deg)`;
+    el.style.opacity=a>4?0:1-a*0.13;
+    el.style.zIndex=100-a;
+    el.classList.toggle("center",off===0);
+  });
+  document.querySelectorAll("#mdots i").forEach((d,i)=>d.className=i===mcenter?"on":"");
+}
+function mmove(dir){mcenter=Math.max(0,Math.min(MOVIES.length-1,mcenter+dir));mlayout();}
+function openMovie(i){ if(i!==mcenter){mcenter=i;mlayout();return;} window.open(rtUrl(MOVIES[i]),"_blank","noopener"); }
 /* ---------- system overview modal ---------- */
 let sysTimer=null;
 const SYS={cpu:[],gpu:[],mem:[],rx:[],tx:[]};
@@ -1396,22 +1553,25 @@ async function activity(){
     const el=document.getElementById("activity");
     if(!items||!items.length){el.innerHTML="";return;}
     el.innerHTML=items.map(a=>{
-      // Only show a real bar once sampling reports >0; before that (model
-      // loading) show an animated indeterminate bar so it clearly reads busy.
-      const pct=(Number.isFinite(a.progress)&&a.progress>0)?a.progress:null;
+      // Segment jobs: fold segment progress into an overall %.
+      let pct=(Number.isFinite(a.progress)&&a.progress>0)?a.progress:null;
+      let segTxt="";
+      if(a.nsegs&&a.nsegs>1&&a.seg){segTxt=`Segment ${a.seg}/${a.nsegs} · `;
+        if(pct!=null)pct=((a.seg-1)+pct/100)/a.nsegs*100;}
       const bar=pct!=null?`<span style="width:${pct}%"></span>`:`<span class="indet"></span>`;
       const step=a.max_steps?` · ${a.step}/${a.max_steps}`:"";
-      const pr=a.prompt?" · "+a.prompt.slice(0,64):"";
+      const pr=a.prompt?" · "+a.prompt.slice(0,60):"";
       return `<div class="act"><div class="ai" style="background:${a.color}22;color:${a.color}">${a.icon}</div>
-        <div style="min-width:0"><div class="an">${a.name} — working</div><div class="ap">${(a.phase||"")}${step}${pr}</div></div>
+        <div style="min-width:0"><div class="an">${a.name} — working</div><div class="ap">${segTxt}${(a.phase||"")}${step}${pr}</div></div>
         <div class="abar">${bar}</div><div class="apct">${pct!=null?pct.toFixed(0)+"%":"…"}</div></div>`;
     }).join("");
   }catch(e){}
 }
-tick();media();activity();
+tick();media();activity();movies();
 setInterval(tick,5000);
 setInterval(media,15000);
 setInterval(activity,2000);
+setInterval(movies,120000);
 </script>
 </body>
 </html>
@@ -1427,6 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -1436,6 +1597,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            # Inline CSS/JS means a cached page = stale styles; always revalidate.
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/api/ping":
@@ -1452,6 +1615,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(service_detail(sid))
         elif self.path == "/api/recent":
             self._json(recent_media())
+        elif self.path == "/api/recent-movies":
+            self._json(recent_movies())
         elif self.path.startswith("/media/"):
             parts = self.path[len("/media/"):].split("/", 1)
             if len(parts) != 2:

@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import random
+import subprocess
 import threading
 import time
 import uuid
@@ -258,6 +259,143 @@ def run_job(job_id, req):
         jobs[job_id].update(status="error", error="Timed out")
 
 
+def _wait_for_mp4(pid, job_id):
+    """Poll ComfyUI history until a prompt finishes. Returns (filename, error).
+    error is None on success, a message on failure, or '__cancelled__'."""
+    for _ in range(2700):
+        time.sleep(4)
+        with jobs_lock:
+            if jobs.get(job_id, {}).get("cancel_requested"):
+                return None, "__cancelled__"
+        try:
+            with urllib.request.urlopen(COMFY_URL + "/history/" + pid, timeout=30) as r:
+                history = json.loads(r.read())
+        except Exception:
+            continue
+        item = history.get(pid)
+        if not item:
+            continue
+        st = item.get("status", {})
+        if st.get("status_str") == "error":
+            msg = "ComfyUI error"
+            for m in st.get("messages", []):
+                if m[0] == "execution_error":
+                    msg = f"{m[1].get('node_type')}: {m[1].get('exception_message', '')[:300]}"
+            return None, msg
+        filename = None
+        subfolder = ""
+        for node_output in item.get("outputs", {}).values():
+            for key in ("images", "video", "gifs"):
+                for out in node_output.get(key, []):
+                    if out.get("filename", "").endswith(".mp4"):
+                        filename = out["filename"]
+                        subfolder = out.get("subfolder", "")
+        if filename:
+            rel = (subfolder + "/" + filename) if subfolder else filename
+            return rel, None
+        return None, "no video produced"
+    return None, "timed out"
+
+
+def _extract_last_frame(mp4_rel, job_id, i):
+    """Grab a frame near the end of a clip into ComfyUI's input dir (for i2v)."""
+    src = OUTPUT_DIR / mp4_rel
+    name = f"chain_{job_id}_{i}.png"
+    dst = COMFY_DIR / "input" / name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-sseof", "-0.3", "-i", str(src),
+                    "-update", "1", "-frames:v", "1", str(dst)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    return name
+
+
+def _concat_segments(seg_files):
+    """ffmpeg-concat the segment mp4s (same codec) into one long video."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    listp = COMFY_DIR / "input" / f"concat_{ts}.txt"
+    with open(listp, "w") as f:
+        for s in seg_files:
+            f.write("file '%s'\n" % (OUTPUT_DIR / s).as_posix())
+    outname = f"wan22_long_{ts}.mp4"
+    outabs = OUTPUT_DIR / "video" / outname
+    outabs.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listp),
+                    "-c", "copy", str(outabs)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+    try:
+        listp.unlink()
+    except Exception:
+        pass
+    return f"video/{outname}"
+
+
+def run_long_job(job_id, req):
+    """Generate N chained segments (last frame -> next start image) and stitch them."""
+    n = max(2, int(req.get("segments", 2)))
+    W, H, L, S = req["width"], req["height"], req["length"], req["steps"]
+    prompt = req["prompt"]
+    client_id = str(uuid.uuid4())
+    if aiohttp is not None:
+        ready = threading.Event()
+        threading.Thread(target=progress_socket, args=(job_id, client_id, ready),
+                         daemon=True).start()
+        ready.wait(timeout=10)
+    with jobs_lock:
+        jobs[job_id].update(status="running", started=time.time(), nsegs=n, seg=1,
+                            progress=0, phase="Model loading", prompt=prompt, long=True)
+    seg_files = []
+    start_image = req.get("start_image")  # optional user image seeds segment 1
+    for i in range(1, n + 1):
+        with jobs_lock:
+            jobs[job_id].update(seg=i, phase=f"Segment {i}/{n}")
+        seed = random.randint(0, 2**32 - 1)
+        wf = build_workflow(prompt, W, H, L, S, seed, start_image)
+        try:
+            pid = comfy_queue(wf, client_id)
+        except Exception as e:
+            with jobs_lock:
+                jobs[job_id].update(status="error", error=str(e))
+            return
+        with jobs_lock:
+            jobs[job_id].update(prompt_id=pid)
+        fn, err = _wait_for_mp4(pid, job_id)
+        if err == "__cancelled__":
+            with jobs_lock:
+                jobs[job_id].update(status="cancelled", phase="Cancelled")
+            return
+        if err:
+            with jobs_lock:
+                jobs[job_id].update(status="error", error=f"Segment {i}/{n}: {err}")
+            return
+        seg_files.append(fn)
+        if i < n:
+            try:
+                start_image = _extract_last_frame(fn, job_id, i)
+            except Exception as e:
+                with jobs_lock:
+                    jobs[job_id].update(status="error", error=f"Frame extract failed: {e}")
+                return
+    with jobs_lock:
+        jobs[job_id].update(phase="Stitching segments", progress=99)
+    try:
+        final = _concat_segments(seg_files)
+    except Exception as e:
+        with jobs_lock:
+            jobs[job_id].update(status="error", error=f"Stitch failed: {e}")
+        return
+    with jobs_lock:
+        jobs[job_id].update(status="done", filename=final, progress=100,
+                            elapsed=int(time.time() - jobs[job_id]["started"]))
+    try:
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "prompt": prompt, "segments": n, "width": W, "height": H,
+                 "length": L, "steps": S, "long": True}
+        with open(VIDEO_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def list_videos():
     vids = []
     if OUTPUT_DIR.exists():
@@ -434,6 +572,15 @@ textarea#prompt::placeholder{color:var(--text3)}
     </div>
 
     <div>
+      <div class="section-label">Stitch — long video</div>
+      <div class="custom-len">
+        <input type="number" id="segments" min="1" max="12" step="1" value="1">
+        <span>segments</span>
+        <span id="seg-info"></span>
+      </div>
+    </div>
+
+    <div>
       <div class="section-label">Quality</div>
       <div class="quality-row">
         <span class="quality-label">Draft</span>
@@ -536,6 +683,13 @@ function buildLenList() {
     };
     el.appendChild(pill);
   });
+  const segInp = document.getElementById('segments');
+  const updateSeg = () => {
+    const n = parseInt(segInp.value) || 1;
+    document.getElementById('seg-info').textContent =
+      n > 1 ? `≈ ${(n * vidLength / 24).toFixed(1)}s total` : '';
+  };
+  segInp.addEventListener('input', updateSeg);
   const inp = document.getElementById('len-secs');
   inp.addEventListener('input', () => {
     const secs = parseFloat(inp.value);
@@ -644,6 +798,7 @@ async function generate() {
     length: vidLength,
     steps: parseInt(document.getElementById('steps-slider').value),
     start_image: mode === 'i2v' ? startImage : null,
+    segments: parseInt(document.getElementById('segments').value) || 1,
   };
 
   setGenerating(true);
@@ -689,13 +844,19 @@ function pollJob(jobId) {
         setGenerating(false);
         showToast(d.error || 'Generation failed', 'error');
       } else {
-        const pct = Number.isFinite(d.progress) ? d.progress : 0;
-        // Real per-step % once sampling starts; soft bar during model load.
-        const width = pct > 0 ? pct : Math.min(30, secs / 4);
+        const segPct = Number.isFinite(d.progress) ? d.progress : 0;
+        // For a stitched job, fold segment progress into an overall bar.
+        let width, segTxt = '';
+        if (d.nsegs && d.nsegs > 1 && d.seg) {
+          width = Math.round(((d.seg - 1) + segPct / 100) / d.nsegs * 100);
+          segTxt = `Segment ${d.seg}/${d.nsegs} · `;
+        } else {
+          width = segPct > 0 ? segPct : Math.min(30, secs / 4);
+        }
         fill.style.width = width + '%';
         const phase = d.phase || 'Model loading';
         const stepInfo = d.max_steps ? ` · ${d.step}/${d.max_steps} steps` : '';
-        text.textContent = `${phase}${stepInfo} · ${Math.round(width)}% · ${secs}s elapsed`;
+        text.textContent = `${segTxt}${phase}${stepInfo} · ${Math.round(width)}% · ${secs}s elapsed`;
       }
     } catch {}
   }, 3000);
@@ -924,7 +1085,8 @@ class Handler(BaseHTTPRequestHandler):
                     if j.get("status") in ("queued", "running"):
                         act = {"active": True, "phase": j.get("phase") or j.get("status"),
                                "progress": j.get("progress"), "step": j.get("step"),
-                               "max_steps": j.get("max_steps"), "prompt": j.get("prompt", "")}
+                               "max_steps": j.get("max_steps"), "prompt": j.get("prompt", ""),
+                               "seg": j.get("seg"), "nsegs": j.get("nsegs")}
             self._json(act or {"active": False})
         elif self.path.startswith("/videos/"):
             rel = urllib.request.url2pathname(self.path[len("/videos/"):])
@@ -949,9 +1111,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "Wan 2.2 models not downloaded — run ./download_wan22_video_models.sh"})
                 return
             job_id = str(uuid.uuid4())[:8]
+            segments = int(req.get("segments") or 1)
             with jobs_lock:
-                jobs[job_id] = {"status": "queued", "prompt": req.get("prompt", "")}
-            threading.Thread(target=run_job, args=(job_id, req), daemon=True).start()
+                jobs[job_id] = {"status": "queued", "prompt": req.get("prompt", ""),
+                                "nsegs": segments if segments > 1 else None}
+            target = run_long_job if segments > 1 else run_job
+            threading.Thread(target=target, args=(job_id, req), daemon=True).start()
             self._json({"job_id": job_id})
         elif self.path == "/api/refine":
             try:
