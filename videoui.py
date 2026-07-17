@@ -137,6 +137,55 @@ def build_workflow(prompt, width, height, length, steps, seed, start_image=None)
     return wf
 
 
+LTXV_CKPT = "ltx-video-2b-v0.9.5.safetensors"
+LTXV_CLIP = "t5xxl_fp16.safetensors"
+LTXV_NEG = ("low quality, worst quality, deformed, distorted, disfigured, motion "
+            "smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly")
+
+
+def ltxv_available():
+    return ((COMFY_DIR / "models/checkpoints" / LTXV_CKPT).exists()
+            and (COMFY_DIR / "models/text_encoders" / LTXV_CLIP).exists())
+
+
+def build_ltxv_workflow(prompt, width, height, length, steps, seed):
+    """LTX-Video 2B t2v — fast, fp16, no fp32 hack. Based on ComfyUI's LTXV template."""
+    width = max(32, round(width / 32) * 32)       # LTXV needs /32 dims
+    height = max(32, round(height / 32) * 32)
+    length = max(9, round((length - 1) / 8) * 8 + 1)  # and 8k+1 frames
+    steps = max(8, steps)                           # 25-30 = best; lower = faster/rougher
+    return {
+        "44": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": LTXV_CKPT}},
+        "38": {"class_type": "CLIPLoader",
+               "inputs": {"clip_name": LTXV_CLIP, "type": "ltxv", "device": "default"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["38", 0], "text": prompt}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["38", 0], "text": LTXV_NEG}},
+        "70": {"class_type": "EmptyLTXVLatentVideo",
+               "inputs": {"width": width, "height": height, "length": length, "batch_size": 1}},
+        "69": {"class_type": "LTXVConditioning",
+               "inputs": {"positive": ["6", 0], "negative": ["7", 0], "frame_rate": 25.0}},
+        "71": {"class_type": "LTXVScheduler",
+               "inputs": {"steps": steps, "max_shift": 2.05, "base_shift": 0.95,
+                          "stretch": True, "terminal": 0.1, "latent": ["70", 0]}},
+        "73": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "72": {"class_type": "SamplerCustom",
+               "inputs": {"add_noise": True, "noise_seed": seed, "cfg": 3.0,
+                          "model": ["44", 0], "positive": ["69", 0], "negative": ["69", 1],
+                          "sampler": ["73", 0], "sigmas": ["71", 0], "latent_image": ["70", 0]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["72", 0], "vae": ["44", 2]}},
+        "11": {"class_type": "CreateVideo", "inputs": {"images": ["8", 0], "fps": 25.0}},
+        "12": {"class_type": "SaveVideo",
+               "inputs": {"video": ["11", 0], "filename_prefix": "video/ltxv",
+                          "format": "mp4", "codec": "h264"}},
+    }
+
+
+def build_video(engine, prompt, width, height, length, steps, seed, start_image=None):
+    if engine == "ltx":
+        return build_ltxv_workflow(prompt, width, height, length, steps, seed)
+    return build_workflow(prompt, width, height, length, steps, seed, start_image)
+
+
 def comfy_queue(workflow, client_id):
     payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
     req = urllib.request.Request(COMFY_URL + "/prompt", data=payload,
@@ -186,8 +235,8 @@ def run_job(job_id, req):
         jobs[job_id].update(prompt=req.get("prompt", ""), created=time.time(),
                             width=req["width"], height=req["height"],
                             length=req["length"], steps=req["steps"])
-    wf = build_workflow(req["prompt"], req["width"], req["height"],
-                        req["length"], req["steps"], seed, req.get("start_image"))
+    wf = build_video(req.get("engine", "wan"), req["prompt"], req["width"], req["height"],
+                     req["length"], req["steps"], seed, req.get("start_image"))
 
     client_id = str(uuid.uuid4())
     if aiohttp is not None:
@@ -349,7 +398,7 @@ def run_long_job(job_id, req):
         with jobs_lock:
             jobs[job_id].update(seg=i, phase=f"Segment {i}/{n}")
         seed = random.randint(0, 2**32 - 1)
-        wf = build_workflow(prompt, W, H, L, S, seed, start_image)
+        wf = build_video(req.get("engine", "wan"), prompt, W, H, L, S, seed, start_image)
         try:
             pid = comfy_queue(wf, client_id)
         except Exception as e:
@@ -534,6 +583,20 @@ textarea#prompt::placeholder{color:var(--text3)}
 <div class="app">
   <aside class="sidebar">
     <div>
+      <div class="section-label">Engine</div>
+      <div class="opt-list" id="engine-list">
+        <div class="opt-card selected" data-engine="ltx" onclick="setEngine('ltx',this)">
+          <div class="opt-radio"></div>
+          <div><div class="opt-name">LTX-Video ⚡</div><div class="opt-desc">Fast, text-to-video</div></div>
+        </div>
+        <div class="opt-card" data-engine="wan" onclick="setEngine('wan',this)">
+          <div class="opt-radio"></div>
+          <div><div class="opt-name">Wan 2.2</div><div class="opt-desc">Slower · image-to-video + stitch</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
       <div class="section-label">Mode</div>
       <div class="opt-list" id="mode-list">
         <div class="opt-card selected" data-mode="t2v" onclick="setMode('t2v',this)">
@@ -571,7 +634,7 @@ textarea#prompt::placeholder{color:var(--text3)}
       </div>
     </div>
 
-    <div>
+    <div id="stitch-section">
       <div class="section-label">Stitch — long video</div>
       <div class="custom-len">
         <input type="number" id="segments" min="1" max="12" step="1" value="1">
@@ -626,7 +689,19 @@ textarea#prompt::placeholder{color:var(--text3)}
 <div id="toast-container"></div>
 
 <script>
+let engine = 'ltx';
 let mode = 't2v';
+function setEngine(e, card) {
+  engine = e;
+  document.querySelectorAll('#engine-list .opt-card').forEach(c => c.classList.remove('selected'));
+  card.classList.add('selected');
+  const ltx = e === 'ltx';
+  // i2v + stitch are Wan-only in this build.
+  const i2vCard = document.querySelector('#mode-list .opt-card[data-mode="i2v"]');
+  if (i2vCard) i2vCard.style.display = ltx ? 'none' : '';
+  document.getElementById('stitch-section').style.display = ltx ? 'none' : '';
+  if (ltx && mode === 'i2v') { mode = 't2v'; document.querySelector('#mode-list .opt-card[data-mode="t2v"]').click(); }
+}
 let startImage = null;
 let resolution = null;
 let vidLength = 49;
@@ -637,6 +712,7 @@ const RESOLUTIONS = __RESOLUTIONS__;
 const LENGTHS = __LENGTHS__;
 
 document.addEventListener('DOMContentLoaded', () => {
+  setEngine('ltx', document.querySelector('#engine-list .opt-card[data-engine="ltx"]'));
   buildResList();
   buildLenList();
   const slider = document.getElementById('steps-slider');
@@ -738,7 +814,10 @@ async function checkServer() {
     const d = await r.json();
     dot.className = d.online ? 'dot online' : 'dot error';
     status.textContent = d.online ? 'Connected' : 'ComfyUI offline';
-    document.getElementById('model-warn').classList.toggle('visible', !d.models);
+    document.getElementById('model-warn').classList.toggle('visible', !d.models && engine === 'wan');
+    // Reflect LTX download state on its engine card.
+    const ltxCard = document.querySelector('#engine-list .opt-card[data-engine="ltx"] .opt-desc');
+    if (ltxCard) ltxCard.textContent = d.ltx ? 'Fast, text-to-video' : 'downloading model…';
   } catch {
     dot.className = 'dot error';
     status.textContent = 'Error';
@@ -799,6 +878,7 @@ async function generate() {
     steps: parseInt(document.getElementById('steps-slider').value),
     start_image: mode === 'i2v' ? startImage : null,
     segments: parseInt(document.getElementById('segments').value) || 1,
+    engine,
   };
 
   setGenerating(true);
@@ -1048,7 +1128,8 @@ class Handler(BaseHTTPRequestHandler):
                     online = True
             except Exception:
                 pass
-            self._json({"online": online, "models": models_available()})
+            self._json({"online": online, "models": models_available(),
+                        "ltx": ltxv_available()})
         elif self.path == "/api/videos":
             self._json(list_videos())
         elif self.path == "/api/random_prompt":
@@ -1107,7 +1188,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._json({"error": "bad json"}, 400)
                 return
-            if not models_available():
+            engine = req.get("engine", "wan")
+            if engine == "ltx":
+                if not ltxv_available():
+                    self._json({"error": "LTX-Video model not downloaded yet — run ./download_ltxv_models.sh"})
+                    return
+                req["segments"] = 1  # LTX is text-to-video only here; no chained stitch
+            elif not models_available():
                 self._json({"error": "Wan 2.2 models not downloaded — run ./download_wan22_video_models.sh"})
                 return
             job_id = str(uuid.uuid4())[:8]
